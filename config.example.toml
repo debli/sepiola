@@ -1,0 +1,53 @@
+# Sepiola 示例配置：复制为 config.toml 后修改路径即可。
+input_dir = "./raws"
+output_dir = "./out"
+jpeg_quality = 92
+workers = 4
+
+[portrait]
+stages = ["lut"]
+[portrait.lut]
+file = "luts/portrait.cube"
+strength = 0.4
+
+[other]
+stages = ["lut"]
+[other.lut]
+file = "luts/landscape.cube"
+strength = 0.7
+
+[safety]
+max_clipped_high = 0.02
+
+[output]
+pixel_format = "8bit"                                # "8bit"（JPEG）或 "16bit"（TIFF）
+keep_metadata = true                                 # 保留源图 EXIF/ICC/注释（仅 JPEG 源生效）
+
+[develop]
+backend = "auto"                                     # "auto" | "darktable" | "builtin"
+
+[identity]
+enabled = true                                       # 人物识别；模型缺失时自动禁用
+model = "models/arcfaceresnet100-11-int8.onnx"
+threshold = 0.35                                     # 余弦相似度阈值，≥ 视为同一人
+gallery = "identities.json"                          # 人物图库（跨批次复用标签）
+landmark_model = "models/2d106det.onnx"              # 关键点对齐模型；空或缺失回退普通裁剪
+update_gallery = true                                # 匹配成功且差异大时追加新嵌入（增量更新）
+max_extra = 4                                        # 每个人物额外嵌入上限
+update_min_sim = 0.5                                 # 与主嵌入余弦低于该值才追加
+
+[scene]
+classifier = "face"                                  # "face" 或 "stub"（测试用）
+model = "models/face_detection_yunet_2023mar.onnx"
+portrait_min_face_ratio = 0.02                       # 最大人脸占整图面积达到 2% 判为人像
+score_threshold = 0.6
+nms_threshold = 0.3
+
+[scene_tags]
+enabled = true                                       # 库相册细分；两个模型都缺失或未命中时兜底"未分类"
+model = "models/mobilenetv2-1.0.onnx"                # ImageNet-1k 分类模型（植物动物/生日/聚会/美食/截图·文档）
+labels = "models/imagenet_classes.txt"               # 类名表，行号即输出下标
+min_confidence = 0.15                                # top-1 置信度低于该值不细分
+places_model = "models/resnet18_places365.onnx"      # Places365 场景模型（风景/建筑/交通/运动/冒险/探险）
+places_classes = "models/places365_classes.txt"      # Places365 类表，行序即输出下标
+places_min_confidence = 0.25                         # Places top-1 置信度低于该值不细分
