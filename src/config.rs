@@ -179,6 +179,24 @@ pub struct SceneTagSettings {
     /// Places top-1 置信度低于该值时不细分。
     #[serde(default = "default_places_min_confidence")]
     pub places_min_confidence: f32,
+    /// 是否启用 MobileCLIP 图文相似度分类；模型缺失时回退旧分类器。
+    #[serde(default = "default_mobileclip_enabled")]
+    pub mobileclip_enabled: bool,
+    /// MobileCLIP2-S0 图像编码器路径。
+    #[serde(default = "default_mobileclip_vision_model")]
+    pub mobileclip_vision_model: String,
+    /// MobileCLIP2-S0 文本编码器路径。
+    #[serde(default = "default_mobileclip_text_model")]
+    pub mobileclip_text_model: String,
+    /// MobileCLIP tokenizer JSON 路径。
+    #[serde(default = "default_mobileclip_tokenizer")]
+    pub mobileclip_tokenizer: String,
+    /// MobileCLIP 最低余弦相似度；低于此值保持未分类。
+    #[serde(default = "default_mobileclip_min_similarity")]
+    pub mobileclip_min_similarity: f32,
+    /// 第一、第二名最低余弦相似度差；低于此值保持未分类。
+    #[serde(default = "default_mobileclip_min_margin")]
+    pub mobileclip_min_margin: f32,
 }
 
 impl Default for SceneTagSettings {
@@ -191,6 +209,12 @@ impl Default for SceneTagSettings {
             places_model: default_places_model(),
             places_classes: default_places_classes(),
             places_min_confidence: default_places_min_confidence(),
+            mobileclip_enabled: default_mobileclip_enabled(),
+            mobileclip_vision_model: default_mobileclip_vision_model(),
+            mobileclip_text_model: default_mobileclip_text_model(),
+            mobileclip_tokenizer: default_mobileclip_tokenizer(),
+            mobileclip_min_similarity: default_mobileclip_min_similarity(),
+            mobileclip_min_margin: default_mobileclip_min_margin(),
         }
     }
 }
@@ -305,6 +329,30 @@ fn default_places_classes() -> String {
 
 fn default_places_min_confidence() -> f32 {
     0.25
+}
+
+fn default_mobileclip_enabled() -> bool {
+    true
+}
+
+fn default_mobileclip_vision_model() -> String {
+    "models/mobileclip2-s0/vision_model.onnx".to_string()
+}
+
+fn default_mobileclip_text_model() -> String {
+    "models/mobileclip2-s0/text_model_quantized.onnx".to_string()
+}
+
+fn default_mobileclip_tokenizer() -> String {
+    "models/mobileclip2-s0/tokenizer.json".to_string()
+}
+
+fn default_mobileclip_min_similarity() -> f32 {
+    0.20
+}
+
+fn default_mobileclip_min_margin() -> f32 {
+    0.015
 }
 
 fn default_update_gallery() -> bool {
@@ -517,6 +565,18 @@ impl Config {
                 self.scene_tags.places_min_confidence
             )));
         }
+        if !(-1.0..=1.0).contains(&self.scene_tags.mobileclip_min_similarity) {
+            return Err(Error::Config(format!(
+                "scene_tags.mobileclip_min_similarity must be -1.0..=1.0, got {}",
+                self.scene_tags.mobileclip_min_similarity
+            )));
+        }
+        if !(0.0..=2.0).contains(&self.scene_tags.mobileclip_min_margin) {
+            return Err(Error::Config(format!(
+                "scene_tags.mobileclip_min_margin must be 0.0..=2.0, got {}",
+                self.scene_tags.mobileclip_min_margin
+            )));
+        }
         for (name, value) in [
             (
                 "scene.portrait_min_face_ratio",
@@ -651,6 +711,17 @@ strength = 1.5
 stages = []
 "#;
         assert!(Config::from_toml(text).is_err());
+    }
+
+    #[test]
+    fn invalid_mobileclip_thresholds_are_rejected() {
+        let mut config = Config::from_toml(EXAMPLE).expect("parse example");
+        config.scene_tags.mobileclip_min_similarity = 1.1;
+        assert!(config.validate().is_err());
+
+        config.scene_tags.mobileclip_min_similarity = 0.2;
+        config.scene_tags.mobileclip_min_margin = -0.1;
+        assert!(config.validate().is_err());
     }
 
     #[test]

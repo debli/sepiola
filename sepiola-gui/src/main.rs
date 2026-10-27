@@ -6,6 +6,10 @@
 
 mod actions;
 mod assets;
+mod book_filters;
+mod book_search;
+mod book_search_view;
+mod books_table;
 mod books_view;
 mod dialogs;
 mod library;
@@ -45,6 +49,7 @@ impl eframe::App for SepiolaApp {
         self.poll_develop(ui.ctx());
         if self.running
             || self.library.scanning
+            || self.library.book_search.content.is_searching()
             || self.thumbs_pending()
             || !self.library.dev_inflight.is_empty()
         {

@@ -286,7 +286,7 @@ fn decode_stride(
             let idx = r * cols + c;
             let cls_score = cls[idx].clamp(0.0, 1.0);
             let obj_score = obj[idx].clamp(0.0, 1.0);
-            let score = (cls_score * obj_score).sqrt();
+            let score = cls_score * obj_score;
             if score < score_threshold {
                 continue;
             }
@@ -419,7 +419,14 @@ mod tests {
         let cls = [0.25];
         let obj = [0.25];
         let bbox = [0.0, 0.0, 0.0, 0.0];
-        // sqrt(0.25*0.25)=0.25 < 0.6
+        assert!(decode_stride(&cls, &obj, &bbox, 1, 1, 8.0, 32.0, 32.0, 0.6).is_empty());
+    }
+
+    #[test]
+    fn decode_uses_product_of_class_and_objectness_scores() {
+        let cls = [0.5];
+        let obj = [0.8];
+        let bbox = [0.0, 0.0, 0.0, 0.0];
         assert!(decode_stride(&cls, &obj, &bbox, 1, 1, 8.0, 32.0, 32.0, 0.6).is_empty());
     }
 

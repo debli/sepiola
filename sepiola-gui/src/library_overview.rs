@@ -57,7 +57,7 @@ impl SepiolaApp {
                     });
                 pointing_hand(response.response);
             }
-            let scan = egui::Button::new(if self.library.scanning { "扫描中…" } else { "扫描归类" })
+            let scan = egui::Button::new(if self.library.scanning { "索引中…" } else { "扫描文件类型" })
                 .min_size(egui::vec2(120.0, 32.0));
             if pointing_hand(ui.add_enabled(!self.library.scanning, scan)).clicked() {
                 self.start_library_scan();
@@ -101,7 +101,9 @@ impl SepiolaApp {
                     for kind in library::ALL_KINDS {
                         let count = counts.get(kind).copied().unwrap_or(0);
                         let enabled =
-                            matches!(*kind, FileKind::Image | FileKind::Book) && count > 0;
+                            matches!(*kind, FileKind::Image | FileKind::Book)
+                                && count > 0
+                                && !self.library.scanning;
                         let text = format!("{}\n{} 项", kind.label(), count);
                         let button = egui::Button::new(
                             egui::RichText::new(text).size(15.0).color(egui::Color32::WHITE),
@@ -113,14 +115,14 @@ impl SepiolaApp {
                                 if count > 0 {
                                     "进入图片库"
                                 } else {
-                                    "先扫描归类后再进入"
+                                    "先扫描文件类型后再进入"
                                 }
                             }
                             FileKind::Book => {
                                 if count > 0 {
                                     "进入书籍库（内容级元数据）"
                                 } else {
-                                    "先扫描归类后再进入"
+                                    "先扫描文件类型后再进入"
                                 }
                             }
                             _ => "浏览页待后续里程碑实现",
@@ -130,8 +132,14 @@ impl SepiolaApp {
                             .clicked()
                         {
                             self.library.page = match kind {
-                                FileKind::Image => LibraryPage::Images,
-                                FileKind::Book => LibraryPage::Books,
+                                FileKind::Image => {
+                                    self.start_image_classification();
+                                    LibraryPage::Images
+                                }
+                                FileKind::Book => {
+                                    self.start_book_metadata_scan(false);
+                                    LibraryPage::Books
+                                }
                                 _ => LibraryPage::Overview,
                             };
                         }

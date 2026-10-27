@@ -44,7 +44,13 @@ score_threshold = 0.6
 nms_threshold = 0.3
 
 [scene_tags]
-enabled = true                                       # 库相册细分；两个模型都缺失或未命中时兜底"未分类"
+enabled = true                                       # 库相册细分；未命中或低置信时为"未分类"
+mobileclip_enabled = true                            # 优先使用 MobileCLIP2-S0 图文相似度分类
+mobileclip_vision_model = "models/mobileclip2-s0/vision_model.onnx"
+mobileclip_text_model = "models/mobileclip2-s0/text_model_quantized.onnx"
+mobileclip_tokenizer = "models/mobileclip2-s0/tokenizer.json"
+mobileclip_min_similarity = 0.20                     # cosine 相似度低于该值时拒判
+mobileclip_min_margin = 0.015                        # top-1 与 top-2 差距过小时拒判
 model = "models/mobilenetv2-1.0.onnx"                # ImageNet-1k 分类模型（植物动物/生日/聚会/美食/截图·文档）
 labels = "models/imagenet_classes.txt"               # 类名表，行号即输出下标
 min_confidence = 0.15                                # top-1 置信度低于该值不细分

@@ -175,6 +175,20 @@ strength = 0.7
 max_clipped_high = 0.02          # 处理后高光溢出超过 2%：strength_scale 减半，重做一次
 ```
 
+### MobileCLIP2-S0 模型文件
+
+模型文件位于被 Git 忽略的 `models/mobileclip2-s0/`，从 HF 镜像下载：
+
+```bash
+mkdir -p models/mobileclip2-s0
+wget -c -P models/mobileclip2-s0 https://hf-mirror.com/felixhrdyn/mobileclip2-s0-onnx/resolve/main/vision_model.onnx
+wget -c -P models/mobileclip2-s0 https://hf-mirror.com/felixhrdyn/mobileclip2-s0-onnx/resolve/main/text_model_quantized.onnx
+wget -c -P models/mobileclip2-s0 https://hf-mirror.com/felixhrdyn/mobileclip2-s0-onnx/resolve/main/tokenizer.json
+wget -c -P models/mobileclip2-s0 https://hf-mirror.com/apple/MobileCLIP2-S0/resolve/main/LICENSE
+```
+
+Apple 原始权重许可仅允许非商业科学研究/学术开发，明确排除产品开发和商业产品/服务。转换仓库的 MIT 标签不覆盖上游权重条款；使用或分发前必须遵守 `models/mobileclip2-s0/LICENSE`。
+
 ## 5. 实现顺序（每步独立可验证，按顺序交给 Qwen）
 
 | 步骤 | 文件 | 验收标准 |

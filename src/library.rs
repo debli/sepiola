@@ -14,10 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::book::{self, BookMeta};
 use crate::config::Config;
-use crate::error::{Error, Result};
 use crate::develop;
+use crate::error::{Error, Result};
 use crate::identity::FaceIdentifier;
 use crate::scene::face::FaceClassifier;
+use crate::scene::mobileclip::MobileClipTagger;
 use crate::scene::places::{album_for_places_class, PlacesTagger};
 use crate::scene::tags::{album_for_class, SceneTagger};
 use crate::scene::{SceneClassifier, SceneKind};
@@ -77,6 +78,7 @@ const INSTALLER_EXTENSIONS: &[&str] = &[
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 /// 音频扩展名 + 文件名含以下关键词时判为"录音"（语音备忘、通话记录等）。
 const RECORDING_KEYWORDS: &[&str] = &["录音", "record", "rec_", "voice", "speech", "通话", "voicemail"];
+pub const IMAGE_CLASSIFICATION_VERSION: u32 = 1;
 
 /// 项目目录标记（全小写，与目录项小写名比较）：命中其一即把整个目录折叠为一个
 /// "项目"实体，内部文件不再单独入库。
@@ -248,11 +250,17 @@ pub struct LibraryEntry {
     /// 书籍内容级元数据（M36），仅 Book 类型扫描时抽取。
     #[serde(default)]
     pub book_meta: Option<BookMeta>,
+    /// 图片相册分类器版本；旧索引默认 0，进入图片库时按需补分类。
+    #[serde(default)]
+    pub image_classification_version: u32,
+    /// 书籍元数据是否已经尝试提取（失败也记录，避免反复解析/告警）。
+    #[serde(default)]
+    pub book_metadata_attempted: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LibraryIndex {
-    /// 索引格式版本；细分规则/模型就绪状态变更后递增，旧索引首次扫描全量重归类。
+    /// 文件类型索引格式版本；图片与书籍处理状态记录在各自条目上。
     /// v3：v2 可能由 Places365/ImageNet 模型缺失的构建写出，标签仍偏旧，强制重归类一次。
     #[serde(default)]
     pub version: u32,
@@ -341,15 +349,15 @@ pub struct ScanReport {
     pub added: usize,
     pub removed: usize,
     pub classified: usize,
+    pub metadata_attempted: usize,
     /// 人脸模型缺失、图片落入"未分类"时为 true。
     pub detector_missing: bool,
 }
 
-/// 增量扫描库目录：新文件归类入库，消失的文件移出索引；项目/游戏目录折叠为实体。
-/// 已有条目保持不动，仅"未分类"且非 manual 的图片在模型可用时补归类。
+/// 增量扫描库目录并识别文件类型；不执行图片推理或书籍内容解析。
 pub fn scan<F>(
     root: &Path,
-    config: &Config,
+    _config: &Config,
     on_event: F,
     cancel: &AtomicBool,
 ) -> Result<ScanReport>
@@ -366,10 +374,7 @@ where
     entities.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut index = LibraryIndex::load(root)?;
-    // v1/v2 旧图片分类需重算；v4 起按扩展名细分文件类型；v5 起回填书籍元数据；
-    // v8 先迁移类型，v9 后续扫描再回填迁移出的旧书籍元数据。
-    let reclass_all = index.version < 4;
-    let backfill_books = index.version < 9;
+    // v8 迁移文件类型；重型任务由类型页按条目状态触发。
     let reclass_file_kinds = index.version < 8;
     let known: std::collections::HashSet<PathBuf> =
         index.entries.iter().map(|entry| entry.rel_path.clone()).collect();
@@ -387,14 +392,7 @@ where
             let needs_reclass = index
                 .find(rel)
                 .map(|entry| {
-                    !entry.manual
-                        && ((reclass_all && entry.kind == FileKind::Image)
-                            || (backfill_books
-                                && entry.kind == FileKind::Book
-                                && entry.book_meta.is_none())
-                            || (reclass_file_kinds && entry.kind != classify_kind(rel))
-                            || (entry.kind == FileKind::Image
-                                && entry.album == ALBUM_UNCLASSIFIED))
+                    !entry.manual && reclass_file_kinds && entry.kind != classify_kind(rel)
                 })
                 .unwrap_or(false);
             if needs_reclass {
@@ -408,7 +406,7 @@ where
         if known.contains(rel.as_path()) {
             let needs_reclass = index
                 .find(rel)
-                .map(|entry| !entry.manual && (reclass_all || entry.kind != *kind))
+                .map(|entry| !entry.manual && entry.kind != *kind)
                 .unwrap_or(false);
             if needs_reclass {
                 pending.push((rel.clone(), Some(*kind), false));
@@ -420,44 +418,12 @@ where
     let total = pending.len();
     on_event(LibraryEvent::Discovered { total });
 
-    // 模型只在有图片待归类且未取消时加载；缺失则回退"未分类"。
-    let has_images = pending
-        .iter()
-        .any(|(rel, entity, _)| entity.is_none() && classify_kind(rel) == FileKind::Image);
-    let detector = if has_images && !cancel.load(Ordering::Relaxed) {
-        FaceClassifier::new(&config.scene_settings).ok()
-    } else {
-        None
-    };
-    let identifier = if detector.is_some() {
-        let mut settings = config.identity.clone();
-        settings.enabled = true;
-        settings.gallery = LibraryIndex::index_path(root)
-            .parent()
-            .map(|dir| dir.join("identities.json").display().to_string())
-            .unwrap_or_default();
-        FaceIdentifier::new(&settings).ok()
-    } else {
-        None
-    };
-    // 场景标签模型缺失时不报错；两者都缺或未命中时兜底"未分类"（不再兜底"风景"）。
-    let tagger = if has_images && config.scene_tags.enabled && !cancel.load(Ordering::Relaxed) {
-        SceneTagger::new(&config.scene_tags).ok()
-    } else {
-        None
-    };
-    let places = if has_images && config.scene_tags.enabled && !cancel.load(Ordering::Relaxed) {
-        PlacesTagger::new(&config.scene_tags).ok()
-    } else {
-        None
-    };
-    let detector_missing = has_images && !cancel.load(Ordering::Relaxed) && detector.is_none();
-
     let mut report = ScanReport {
         added: 0,
         removed,
         classified: 0,
-        detector_missing,
+        metadata_attempted: 0,
+        detector_missing: false,
     };
     let mut interrupted = false;
     for (completed, (rel, entity, is_new)) in pending.iter().enumerate() {
@@ -475,34 +441,13 @@ where
             (*entity_kind, dir_name, None, None)
         } else {
             let kind = classify_kind(rel);
-            let (album, person) = if kind == FileKind::Image && !detector_missing {
-                auto_album(
-                    &root.join(rel),
-                    detector.as_ref(),
-                    identifier.as_ref(),
-                    tagger.as_ref(),
-                    places.as_ref(),
-                    config.scene_tags.min_confidence,
-                    config.scene_tags.places_min_confidence,
-                )
-            } else if kind == FileKind::Image {
-                (ALBUM_UNCLASSIFIED.to_string(), None)
+            let album = if kind == FileKind::Image {
+                ALBUM_UNCLASSIFIED.to_string()
             } else {
-                (String::new(), None)
+                String::new()
             };
-            if kind == FileKind::Image {
-                report.classified += 1;
-            }
-            // 书籍：解析文件内容抽取元数据（失败为 None，不阻断扫描）。
-            let should_extract_book_meta = *is_new
-                || index.find(rel).is_some_and(|entry| {
-                    backfill_books && entry.kind == FileKind::Book && entry.book_meta.is_none()
-                });
-            let book_meta = if kind == FileKind::Book && should_extract_book_meta {
-                book::extract(&root.join(rel))
-            } else {
-                None
-            };
+            let person = None;
+            let book_meta = None;
             (kind, album, person, book_meta)
         };
         if *is_new {
@@ -513,15 +458,17 @@ where
                 person,
                 manual: false,
                 book_meta,
+                image_classification_version: 0,
+                book_metadata_attempted: false,
             });
             report.added += 1;
         } else if let Some(entry) = index.find_mut(rel) {
             entry.kind = kind;
             entry.album = album;
             entry.person = person;
-            if book_meta.is_some() {
-                entry.book_meta = book_meta;
-            }
+            entry.book_meta = book_meta;
+            entry.image_classification_version = 0;
+            entry.book_metadata_attempted = false;
         }
         on_event(LibraryEvent::Processed {
             completed: completed + 1,
@@ -532,7 +479,156 @@ where
 
     index.entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     if !interrupted {
-        index.version = if reclass_file_kinds { 8 } else { 9 };
+        index.version = if reclass_file_kinds {
+            8
+        } else {
+            index.version.max(8)
+        };
+    }
+    index.save(root)?;
+    Ok(report)
+}
+
+/// 对待处理图片执行人像检测与相册分类；已完成和手动标记的条目保持不动。
+pub fn classify_images<F>(
+    root: &Path,
+    config: &Config,
+    force: bool,
+    on_event: F,
+    cancel: &AtomicBool,
+) -> Result<ScanReport>
+where
+    F: Fn(LibraryEvent),
+{
+    let mut index = LibraryIndex::load(root)?;
+    let pending: Vec<PathBuf> = index
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == FileKind::Image
+                && !entry.manual
+                && (force
+                    || entry.image_classification_version < IMAGE_CLASSIFICATION_VERSION)
+        })
+        .map(|entry| entry.rel_path.clone())
+        .collect();
+    let total = pending.len();
+    on_event(LibraryEvent::Discovered { total });
+
+    let detector = if total > 0 && !cancel.load(Ordering::Relaxed) {
+        FaceClassifier::new(&config.scene_settings).ok()
+    } else {
+        None
+    };
+    let detector_missing = total > 0 && !cancel.load(Ordering::Relaxed) && detector.is_none();
+    let mut report = ScanReport {
+        detector_missing,
+        ..ScanReport::default()
+    };
+    if detector.is_none() {
+        return Ok(report);
+    }
+
+    let mut identity_settings = config.identity.clone();
+    identity_settings.enabled = true;
+    identity_settings.gallery = LibraryIndex::index_path(root)
+        .parent()
+        .map(|dir| dir.join("identities.json").display().to_string())
+        .unwrap_or_default();
+    let identifier = FaceIdentifier::new(&identity_settings).ok();
+    let mobileclip = if config.scene_tags.enabled && config.scene_tags.mobileclip_enabled {
+        match MobileClipTagger::new(&config.scene_tags) {
+            Ok(tagger) => Some(tagger),
+            Err(error) => {
+                tracing::warn!(%error, "MobileCLIP unavailable; falling back to ImageNet and Places365");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let tagger = if config.scene_tags.enabled {
+        SceneTagger::new(&config.scene_tags).ok()
+    } else {
+        None
+    };
+    let places = if config.scene_tags.enabled {
+        PlacesTagger::new(&config.scene_tags).ok()
+    } else {
+        None
+    };
+
+    for (completed, rel) in pending.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let (album, person) = auto_album(
+            &root.join(rel),
+            detector.as_ref(),
+            identifier.as_ref(),
+            mobileclip.as_ref(),
+            tagger.as_ref(),
+            places.as_ref(),
+            config.scene_tags.min_confidence,
+            config.scene_tags.places_min_confidence,
+        );
+        if let Some(entry) = index.find_mut(rel) {
+            entry.album = album;
+            entry.person = person;
+            entry.image_classification_version = IMAGE_CLASSIFICATION_VERSION;
+            report.classified += 1;
+        }
+        on_event(LibraryEvent::Processed {
+            completed: completed + 1,
+            total,
+            rel_path: rel.clone(),
+        });
+    }
+    index.save(root)?;
+    Ok(report)
+}
+
+/// 对待处理书籍抽取内容级元数据；失败也记录为已尝试，避免每次进入页面重复解析。
+pub fn extract_book_metadata<F>(
+    root: &Path,
+    retry_failed: bool,
+    on_event: F,
+    cancel: &AtomicBool,
+) -> Result<ScanReport>
+where
+    F: Fn(LibraryEvent),
+{
+    let mut index = LibraryIndex::load(root)?;
+    let pending: Vec<PathBuf> = index
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == FileKind::Book
+                && !entry.manual
+                && entry.book_meta.is_none()
+                && (!entry.book_metadata_attempted || retry_failed)
+        })
+        .map(|entry| entry.rel_path.clone())
+        .collect();
+    let total = pending.len();
+    on_event(LibraryEvent::Discovered { total });
+    let mut report = ScanReport::default();
+
+    for (completed, rel) in pending.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let metadata = book::extract(&root.join(rel));
+        if let Some(entry) = index.find_mut(rel) {
+            entry.book_meta = metadata;
+            entry.book_metadata_attempted = true;
+            report.metadata_attempted += 1;
+        }
+        on_event(LibraryEvent::Processed {
+            completed: completed + 1,
+            total,
+            rel_path: rel.clone(),
+        });
     }
     index.save(root)?;
     Ok(report)
@@ -545,6 +641,7 @@ fn auto_album(
     path: &Path,
     detector: Option<&FaceClassifier>,
     identifier: Option<&FaceIdentifier>,
+    mobileclip: Option<&MobileClipTagger>,
     tagger: Option<&SceneTagger>,
     places: Option<&PlacesTagger>,
     min_confidence: f32,
@@ -571,6 +668,19 @@ fn auto_album(
         return (ALBUM_PORTRAIT.to_string(), person);
     }
     let unclassified = || (ALBUM_UNCLASSIFIED.to_string(), None);
+    if let Some(mobileclip) = mobileclip {
+        match mobileclip.tag(&image) {
+            Ok(Some(tag)) => return (tag.album.to_string(), None),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "MobileCLIP inference failed; falling back to legacy classifiers"
+                );
+            }
+        }
+    }
     if let Some(tagger) = tagger {
         if let Ok(tag) = tagger.tag(&image) {
             if tag.confidence >= min_confidence {
@@ -760,12 +870,8 @@ mod tests {
         let cancel = AtomicBool::new(true);
         scan(&root, &Config::default(), |_| (), &cancel).expect("cancelled scan");
         let index = LibraryIndex::load(&root).expect("load after cancellation");
-        assert_eq!(index.version, 8);
-        assert!(index
-            .find(Path::new("book.fb2"))
-            .expect("book entry")
-            .book_meta
-            .is_none());
+        assert_eq!(index.version, 0);
+        assert!(index.entries.is_empty());
 
         let cancel = AtomicBool::new(false);
         scan(&root, &Config::default(), |_| (), &cancel).expect("retry scan");
@@ -800,6 +906,8 @@ mod tests {
                 person: None,
                 manual: false,
                 book_meta: None,
+                image_classification_version: 0,
+                book_metadata_attempted: false,
             }],
         };
         index.save(&root).expect("save");
@@ -845,6 +953,8 @@ mod tests {
                     person: None,
                     manual: false,
                     book_meta: None,
+                    image_classification_version: 0,
+                    book_metadata_attempted: false,
                 })
                 .collect(),
         };
@@ -874,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v8_backfills_existing_book_metadata() {
+    fn book_metadata_is_extracted_only_by_book_task() {
         let root = temp_root("migrate8-book-meta");
         std::fs::write(
             root.join("book.fb2"),
@@ -892,6 +1002,8 @@ mod tests {
                 person: None,
                 manual: false,
                 book_meta: None,
+                image_classification_version: 0,
+                book_metadata_attempted: false,
             }],
         };
         index.save(&root).expect("save");
@@ -899,20 +1011,31 @@ mod tests {
         let cancel = AtomicBool::new(false);
         scan(&root, &Config::default(), |_| (), &cancel).expect("scan");
         let index = LibraryIndex::load(&root).expect("load");
+        let entry = index.find(Path::new("book.fb2")).expect("book entry");
+        assert!(entry.book_meta.is_none());
+        assert!(!entry.book_metadata_attempted);
+        drop(index);
+
+        let report = extract_book_metadata(&root, false, |_| (), &cancel).expect("extract");
+        assert_eq!(report.metadata_attempted, 1);
+        let index = LibraryIndex::load(&root).expect("load after extraction");
         let meta = index
             .find(Path::new("book.fb2"))
             .and_then(|entry| entry.book_meta.as_ref())
             .expect("backfilled book metadata");
         assert_eq!(meta.title.as_deref(), Some("回填测试书"));
         assert_eq!(meta.author.as_deref(), Some("测试作者"));
-        assert_eq!(index.version, 9);
+        assert!(index
+            .find(Path::new("book.fb2"))
+            .expect("book entry")
+            .book_metadata_attempted);
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn migration_v5_backfills_book_meta() {
         let root = temp_root("migrate5");
-        // v4 索引已有书籍条目但无元数据；写入一个合法 FB2，扫描应回填 book_meta。
+        // v4 索引已有书籍条目但无元数据；类型扫描不应解析正文。
         std::fs::write(
             root.join("a.fb2"),
             r#"<?xml version="1.0"?><FictionBook><description><title-info>
@@ -929,6 +1052,8 @@ mod tests {
                 person: None,
                 manual: false,
                 book_meta: None,
+                image_classification_version: 0,
+                book_metadata_attempted: false,
             }],
         };
         index.save(&root).expect("save");
@@ -937,10 +1062,63 @@ mod tests {
         let index = LibraryIndex::load(&root).expect("load");
         let entry = index.find(Path::new("a.fb2")).expect("entry");
         assert_eq!(entry.kind, FileKind::Book);
+        assert!(entry.book_meta.is_none());
+        assert!(!entry.book_metadata_attempted);
+        assert_eq!(index.version, 8);
+        drop(index);
+
+        extract_book_metadata(&root, false, |_| (), &cancel).expect("extract book meta");
+        let index = LibraryIndex::load(&root).expect("load after extraction");
+        let entry = index.find(Path::new("a.fb2")).expect("entry");
         let meta = entry.book_meta.as_ref().expect("book meta backfilled");
         assert_eq!(meta.title.as_deref(), Some("测试书"));
         assert_eq!(meta.author.as_deref(), Some("测试者"));
-        assert_eq!(index.version, 8);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn type_scan_defers_image_and_book_processing() {
+        let root = temp_root("type-scan-only");
+        std::fs::write(root.join("photo.jpg"), b"not an image").expect("write image");
+        std::fs::write(
+            root.join("book.fb2"),
+            r#"<?xml version="1.0"?><FictionBook><description><title-info>
+<book-title>Deferred</book-title></title-info></description></FictionBook>"#,
+        )
+        .expect("write book");
+
+        let cancel = AtomicBool::new(false);
+        let report = scan(&root, &Config::default(), |_| (), &cancel).expect("type scan");
+        assert_eq!(report.added, 2);
+        let index = LibraryIndex::load(&root).expect("load index");
+        let image = index.find(Path::new("photo.jpg")).expect("image entry");
+        assert_eq!(image.album, ALBUM_UNCLASSIFIED);
+        assert_eq!(image.image_classification_version, 0);
+        let book = index.find(Path::new("book.fb2")).expect("book entry");
+        assert!(book.book_meta.is_none());
+        assert!(!book.book_metadata_attempted);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn failed_book_metadata_is_not_retried_without_request() {
+        let root = temp_root("book-meta-retry");
+        std::fs::write(root.join("broken.fb2"), b"not valid fb2").expect("write book");
+        let cancel = AtomicBool::new(false);
+        scan(&root, &Config::default(), |_| (), &cancel).expect("type scan");
+
+        let first = extract_book_metadata(&root, false, |_| (), &cancel).expect("first attempt");
+        assert_eq!(first.metadata_attempted, 1);
+        let index = LibraryIndex::load(&root).expect("load index");
+        let entry = index.find(Path::new("broken.fb2")).expect("book entry");
+        assert!(entry.book_meta.is_none());
+        assert!(entry.book_metadata_attempted);
+        drop(index);
+
+        let skipped = extract_book_metadata(&root, false, |_| (), &cancel).expect("skip attempt");
+        assert_eq!(skipped.metadata_attempted, 0);
+        let retried = extract_book_metadata(&root, true, |_| (), &cancel).expect("retry attempt");
+        assert_eq!(retried.metadata_attempted, 1);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1070,6 +1248,8 @@ mod tests {
             person: Some("person_1".to_string()),
             manual: false,
             book_meta: None,
+            image_classification_version: 0,
+            book_metadata_attempted: false,
         });
         index.entries.push(LibraryEntry {
             rel_path: PathBuf::from("s.jpg"),
@@ -1078,6 +1258,8 @@ mod tests {
             person: None,
             manual: false,
             book_meta: None,
+            image_classification_version: 0,
+            book_metadata_attempted: false,
         });
         index.entries.push(LibraryEntry {
             rel_path: PathBuf::from("v.mp4"),
@@ -1086,6 +1268,8 @@ mod tests {
             person: None,
             manual: false,
             book_meta: None,
+            image_classification_version: 0,
+            book_metadata_attempted: false,
         });
         let albums = index.albums();
         assert_eq!(albums.get(ALBUM_PORTRAIT), Some(&1));

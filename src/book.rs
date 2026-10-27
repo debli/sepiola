@@ -8,8 +8,11 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, UTF_8, WINDOWS_1252};
 use quick_xml::events::Event as XmlEvent;
 use serde::{Deserialize, Serialize};
+
+const MAX_CONTENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// 内容级抽取的书籍元数据，各字段独立可缺省。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -81,6 +84,226 @@ pub fn extract(path: &Path) -> Option<BookMeta> {
         _ => return None,
     };
     (!meta.is_empty()).then_some(meta)
+}
+
+/// 判断电子书正文是否包含关键词；格式解析在调用方后台线程运行。
+pub fn contains_text(path: &Path, needle: &str) -> bool {
+    let needle = needle.trim().to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let text = match ext.as_str() {
+        "epub" => epub_content_text(path),
+        "pdf" => pdf_content_text(path),
+        "fb2" => fb2_content_text(path),
+        "mobi" | "azw" | "azw3" | "asw3" => mobi_content_text(path),
+        _ => None,
+    };
+    text.is_some_and(|text| text.to_lowercase().contains(&needle))
+}
+
+fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_CONTENT_BYTES as u64 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CONTENT_BYTES as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+fn epub_content_text(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut text = String::new();
+    let mut remaining = MAX_CONTENT_BYTES;
+    for index in 0..zip.len() {
+        if remaining == 0 {
+            break;
+        }
+        let entry = zip.by_index(index).ok()?;
+        let name = entry.name().to_ascii_lowercase();
+        if !(name.ends_with(".xhtml") || name.ends_with(".html") || name.ends_with(".htm")) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        entry
+            .take(remaining as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        remaining -= bytes.len();
+        text.push_str(&strip_markup(&String::from_utf8_lossy(&bytes)));
+    }
+    Some(text)
+}
+
+fn pdf_content_text(path: &Path) -> Option<String> {
+    let bytes = read_bounded(path)?;
+    std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
+        .ok()?
+        .ok()
+}
+
+fn fb2_content_text(path: &Path) -> Option<String> {
+    let bytes = read_bounded(path)?;
+    let raw = String::from_utf8_lossy(&bytes);
+    let mut reader = quick_xml::Reader::from_str(&raw);
+    reader.config_mut().trim_text(true);
+    let mut text = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(XmlEvent::Text(event)) => text.push_str(&event.unescape().ok()?),
+            Ok(XmlEvent::CData(event)) => text.push_str(&String::from_utf8_lossy(&event)),
+            Ok(XmlEvent::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    Some(text)
+}
+
+fn strip_markup(raw: &str) -> String {
+    let mut text = String::with_capacity(raw.len());
+    let mut in_tag = false;
+    for ch in raw.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if in_tag => {}
+            _ => text.push(ch),
+        }
+    }
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn mobi_content_text(path: &Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut database_header = [0u8; 78];
+    file.read_exact(&mut database_header).ok()?;
+    let record_count = u16::from_be_bytes([database_header[76], database_header[77]]) as usize;
+    if record_count < 2 || record_count > 65_536 {
+        return None;
+    }
+    let table_len = record_count.checked_mul(8)?;
+    let table_end = 78u64.checked_add(table_len as u64)?;
+    if table_end > file_len {
+        return None;
+    }
+    let mut table = vec![0u8; table_len];
+    file.read_exact(&mut table).ok()?;
+    let offsets: Vec<u64> = table
+        .chunks_exact(8)
+        .map(|entry| Some(u32::from_be_bytes(entry[..4].try_into().ok()?) as u64))
+        .collect::<Option<_>>()?;
+    if offsets.iter().any(|offset| *offset < table_end || *offset >= file_len)
+        || offsets.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return None;
+    }
+    let read_record = |file: &mut std::fs::File, index: usize| -> Option<Vec<u8>> {
+        let start = *offsets.get(index)?;
+        let end = offsets.get(index + 1).copied().unwrap_or(file_len);
+        let len = end.checked_sub(start)?;
+        if len == 0 || len > MAX_CONTENT_BYTES as u64 {
+            return None;
+        }
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut bytes = vec![0u8; len as usize];
+        file.read_exact(&mut bytes).ok()?;
+        Some(bytes)
+    };
+    let record0 = read_record(&mut file, 0)?;
+    let compression = u16_be(&record0, 0)?;
+    if !matches!(compression, 1 | 2) || u16_be(&record0, 12)? != 0 {
+        return None;
+    }
+    let text_length = u32_be(&record0, 4)? as usize;
+    let text_records = (u16_be(&record0, 8)? as usize).min(record_count - 1);
+    let mobi_offset = find_sub(&record0, b"MOBI", 16)?;
+    let codepage = u32_be(&record0, mobi_offset + 12)?;
+    let mut content = Vec::with_capacity(text_length.min(MAX_CONTENT_BYTES));
+    for index in 1..=text_records {
+        if content.len() >= MAX_CONTENT_BYTES {
+            break;
+        }
+        let record = read_record(&mut file, index)?;
+        let decoded = if compression == 1 {
+            record
+        } else {
+            decompress_palmdoc(&record, MAX_CONTENT_BYTES - content.len())?
+        };
+        content.extend_from_slice(&decoded[..decoded.len().min(MAX_CONTENT_BYTES - content.len())]);
+    }
+    if text_length > 0 {
+        content.truncate(content.len().min(text_length));
+    }
+    let encoding = match codepage {
+        65001 => UTF_8,
+        936 => GBK,
+        932 => SHIFT_JIS,
+        950 => BIG5,
+        949 => EUC_KR,
+        _ => WINDOWS_1252,
+    };
+    let decoded = encoding.decode(&content).0;
+    Some(strip_markup(&decoded))
+}
+
+fn decompress_palmdoc(input: &[u8], limit: usize) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() && output.len() < limit {
+        let byte = input[cursor];
+        cursor += 1;
+        match byte {
+            0x00 => output.push(byte),
+            0x01..=0x08 => {
+                let end = cursor.checked_add(byte as usize)?;
+                output.extend_from_slice(input.get(cursor..end)?);
+                cursor = end;
+            }
+            0x09..=0x7f => output.push(byte),
+            0x80..=0xbf => {
+                let next = *input.get(cursor)?;
+                cursor += 1;
+                let distance = (((byte & 0x3f) as usize) << 5) | ((next >> 3) as usize);
+                let length = (next as usize & 0x07) + 3;
+                if distance == 0 {
+                    return None;
+                }
+                for _ in 0..length.min(limit - output.len()) {
+                    let source = output.len().checked_sub(distance)?;
+                    output.push(output[source]);
+                }
+            }
+            0xc0..=0xff => {
+                output.push(b' ');
+                output.push(byte ^ 0x80);
+            }
+        }
+    }
+    Some(output)
 }
 
 // ---------------------------------------------------------------- EPUB
@@ -674,6 +897,7 @@ mod tests {
         assert_eq!(meta.year, Some(2012));
         assert_eq!(meta.edition.as_deref(), Some("第三版"));
         assert_eq!(meta.isbn.as_deref(), Some("978-7-5063-6082-6"));
+        assert!(contains_text(&path, "第三版"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -701,6 +925,7 @@ mod tests {
         assert_eq!(meta.translator.as_deref(), Some("刘 姿函"));
         assert_eq!(meta.publisher.as_deref(), Some("南海出版公司"));
         assert_eq!(meta.year, Some(2013));
+        assert!(contains_text(&path, "刘姿函"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -765,7 +990,48 @@ mod tests {
         let meta = extract(&path).expect("pdf meta");
         assert_eq!(meta.year, Some(2015));
         assert_eq!(meta.isbn.as_deref(), Some("978-0-00-000000-1"));
+        assert!(contains_text(&path, "copyright"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mobi_palm_doc_content() {
+        let dir = temp_dir("mobi-content");
+        let path = dir.join("book.mobi");
+        let text = [4, 0xd6, 0xd0, 0xb9, 0xfa];
+        let mut record0 = vec![0u8; 32];
+        record0[0..2].copy_from_slice(&2u16.to_be_bytes());
+        record0[4..8].copy_from_slice(&4u32.to_be_bytes());
+        record0[8..10].copy_from_slice(&1u16.to_be_bytes());
+        record0[12..14].copy_from_slice(&0u16.to_be_bytes());
+        record0[16..20].copy_from_slice(b"MOBI");
+        record0[28..32].copy_from_slice(&936u32.to_be_bytes());
+
+        let first_record = 78 + 2 * 8;
+        let second_record = first_record + record0.len();
+        let mut file = vec![0u8; first_record];
+        file[76..78].copy_from_slice(&2u16.to_be_bytes());
+        file[78..82].copy_from_slice(&(first_record as u32).to_be_bytes());
+        file[86..90].copy_from_slice(&(second_record as u32).to_be_bytes());
+        file.extend_from_slice(&record0);
+        file.extend_from_slice(&text);
+        std::fs::write(&path, file).expect("write mobi");
+
+        assert!(contains_text(&path, "中国"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn palm_doc_literal_and_back_reference() {
+        let decoded = decompress_palmdoc(&[5, b'h', b'e', b'l', b'l', b'o', 0x80, 0x2a], 64)
+            .expect("decode");
+        assert_eq!(decoded, b"hellohello");
+    }
+
+    #[test]
+    fn markup_text_preserves_tag_boundaries_and_decodes_entities() {
+        let text = strip_markup("<p>hello</p><p>world &amp; friends</p>");
+        assert!(text.contains("hello world & friends"));
     }
 
     #[test]

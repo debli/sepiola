@@ -207,7 +207,7 @@ fn preprocess(img: &ImageF32) -> Vec<f32> {
 }
 
 /// 双线性缩放使短边等于 `side`（放大或缩小）。
-fn resize_short_side(img: &ImageF32, side: usize) -> ImageF32 {
+pub(crate) fn resize_short_side(img: &ImageF32, side: usize) -> ImageF32 {
     let shortest = (img.width.min(img.height) as usize).max(1);
     if shortest == side {
         return img.clone();
@@ -248,7 +248,7 @@ fn resize_short_side(img: &ImageF32, side: usize) -> ImageF32 {
 }
 
 /// 居中裁剪 `side`×`side`（短边已 ≥ side）。
-fn center_crop(img: &ImageF32, side: usize) -> ImageF32 {
+pub(crate) fn center_crop(img: &ImageF32, side: usize) -> ImageF32 {
     let w = img.width as usize;
     let h = img.height as usize;
     let offset_x = w.saturating_sub(side) / 2;

@@ -10,6 +10,7 @@ use eframe::egui;
 use sepiola::config::Config;
 use sepiola::library::{self, LibraryEvent, LibraryIndex, LibraryMessage};
 
+use crate::book_search::BookSearchState;
 use crate::library_develop::{DevelopEvent, DevelopTask};
 use crate::library_thumbs::ThumbResult;
 use crate::state::{Preview, SepiolaApp};
@@ -29,6 +30,14 @@ pub enum LibraryPage {
     Books,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LibraryTask {
+    Index,
+    Images,
+    ReclassifyImages,
+    Books,
+}
+
 /// 库页签的状态与后台扫描线程。
 pub struct LibraryState {
     pub page: LibraryPage,
@@ -38,6 +47,7 @@ pub struct LibraryState {
     pub selected_rel: Option<PathBuf>,
     pub album_draft: String,
     pub scanning: bool,
+    pub active_task: Option<LibraryTask>,
     pub cancel: Arc<AtomicBool>,
     pub progress: (usize, usize),
     pub message: String,
@@ -63,6 +73,7 @@ pub struct LibraryState {
     pub dev_done: usize,
     pub dev_ok: usize,
     pub dev_fail: usize,
+    pub book_search: BookSearchState,
 }
 
 impl Default for LibraryState {
@@ -75,6 +86,7 @@ impl Default for LibraryState {
             selected_rel: None,
             album_draft: String::new(),
             scanning: false,
+            active_task: None,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: (0, 0),
             message: String::new(),
@@ -91,6 +103,7 @@ impl Default for LibraryState {
             dev_done: 0,
             dev_ok: 0,
             dev_fail: 0,
+            book_search: BookSearchState::default(),
         }
     }
 }
@@ -126,10 +139,15 @@ impl SepiolaApp {
         if self.library.scanning {
             self.library.cancel.store(true, Ordering::Relaxed);
             self.library.scanning = false;
+            self.library.active_task = None;
             self.library.receiver = None;
         }
         self.library.root = root.display().to_string();
         self.library.index = LibraryIndex::load(&root).unwrap_or_default();
+        self.library
+            .book_search
+            .refresh_facets(&self.library.index.entries);
+        self.library.book_search.reset();
         self.library.selected_rel = None;
         self.library.preview = None;
         self.library.selected_album = None;
@@ -140,6 +158,25 @@ impl SepiolaApp {
     }
 
     pub fn start_library_scan(&mut self) {
+        self.start_library_task(LibraryTask::Index, false);
+    }
+
+    pub fn start_image_classification(&mut self) {
+        self.start_library_task(LibraryTask::Images, false);
+    }
+
+    pub fn start_image_reclassification(&mut self) {
+        self.start_library_task(LibraryTask::ReclassifyImages, false);
+    }
+
+    pub fn start_book_metadata_scan(&mut self, retry_failed: bool) {
+        self.start_library_task(LibraryTask::Books, retry_failed);
+    }
+
+    fn start_library_task(&mut self, task: LibraryTask, retry_failed: bool) {
+        if self.library.scanning {
+            return;
+        }
         let Some(root) = non_empty_root(&self.library.root) else {
             self.library.message = "请先选择库目录".to_string();
             return;
@@ -148,28 +185,40 @@ impl SepiolaApp {
             self.library.message = format!("库目录不存在：{}", root.display());
             return;
         }
-        self.select_library_root(root.clone());
         let config = scan_config(self);
         self.library.scanning = true;
+        self.library.active_task = Some(task);
         self.library.progress = (0, 0);
         self.library.cancel = Arc::new(AtomicBool::new(false));
-        self.library.message = "扫描归类中…".to_string();
+        self.library.message = match task {
+            LibraryTask::Index => "扫描文件类型…".to_string(),
+            LibraryTask::Images => "分类图片…".to_string(),
+            LibraryTask::ReclassifyImages => "重新分类图片…".to_string(),
+            LibraryTask::Books => "提取书籍元数据…".to_string(),
+        };
         let (sender, receiver) = channel();
         self.library.receiver = Some(receiver);
         let sender = Arc::new(Mutex::new(sender));
         let hook = Arc::clone(&sender);
         let cancel = Arc::clone(&self.library.cancel);
         std::thread::spawn(move || {
-            let result = library::scan(
-                &root,
-                &config,
-                move |event| {
+            let on_event = move |event| {
                     if let Ok(sender) = hook.lock() {
                         let _ = sender.send(LibraryMessage::Event(event));
                     }
-                },
-                &cancel,
-            )
+                };
+            let result = match task {
+                LibraryTask::Index => library::scan(&root, &config, on_event, &cancel),
+                LibraryTask::Images => {
+                    library::classify_images(&root, &config, false, on_event, &cancel)
+                }
+                LibraryTask::ReclassifyImages => {
+                    library::classify_images(&root, &config, true, on_event, &cancel)
+                }
+                LibraryTask::Books => {
+                    library::extract_book_metadata(&root, retry_failed, on_event, &cancel)
+                }
+            }
             .map_err(|error| error.to_string());
             if let Ok(sender) = sender.lock() {
                 let _ = sender.send(LibraryMessage::Done(result));
@@ -178,6 +227,7 @@ impl SepiolaApp {
     }
 
     pub fn poll_library(&mut self) {
+        self.library.book_search.content.poll();
         let mut finished = false;
         if let Some(receiver) = &self.library.receiver {
             loop {
@@ -194,19 +244,38 @@ impl SepiolaApp {
                     }
                     Ok(LibraryMessage::Done(result)) => {
                         self.library.scanning = false;
+                        let task = self.library.active_task.take().unwrap_or(LibraryTask::Index);
                         let root = PathBuf::from(self.library.root.trim());
                         self.library.index = LibraryIndex::load(&root).unwrap_or_default();
+                        self.library
+                            .book_search
+                            .refresh_facets(&self.library.index.entries);
+                        self.library.book_search.reset();
                         self.library.message = match result {
                             Ok(report) => {
                                 let fallback = if report.detector_missing {
-                                    "（模型缺失，图片归入未分类）"
+                                    "（人脸模型缺失，未处理图片保持原标签）"
                                 } else {
                                     ""
                                 };
-                                format!(
-                                    "扫描完成：新增 {}，移除 {}，归类 {}{}",
-                                    report.added, report.removed, report.classified, fallback
-                                )
+                                match task {
+                                    LibraryTask::Index => format!(
+                                        "类型扫描完成：新增 {}，移除 {}",
+                                        report.added, report.removed
+                                    ),
+                                    LibraryTask::Images => format!(
+                                        "图片分类完成：{} 张{}",
+                                        report.classified, fallback
+                                    ),
+                                    LibraryTask::ReclassifyImages => format!(
+                                        "重新分类完成：{} 张{}",
+                                        report.classified, fallback
+                                    ),
+                                    LibraryTask::Books => format!(
+                                        "书籍元数据处理完成：{} 本",
+                                        report.metadata_attempted
+                                    ),
+                                }
                             }
                             Err(error) => format!("扫描失败：{error}"),
                         };
@@ -216,6 +285,7 @@ impl SepiolaApp {
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         self.library.scanning = false;
+                        self.library.active_task = None;
                         self.library.message = "扫描线程已退出".to_string();
                         finished = true;
                         break;
@@ -227,4 +297,5 @@ impl SepiolaApp {
             self.library.receiver = None;
         }
     }
+
 }

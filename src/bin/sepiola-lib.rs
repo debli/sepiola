@@ -1,7 +1,9 @@
 //! 媒体库命令行：扫描库目录、查看相册、浏览与重新打标签。
 //!
 //! ```bash
-//! cargo run --bin sepiola-lib -- scan ~/Photos -c config.toml
+//! cargo run --bin sepiola-lib -- scan ~/Photos
+//! cargo run --bin sepiola-lib -- classify-images ~/Photos -c config.toml
+//! cargo run --bin sepiola-lib -- extract-books ~/Photos
 //! cargo run --bin sepiola-lib -- albums ~/Photos
 //! cargo run --bin sepiola-lib -- list ~/Photos --album 人像
 //! cargo run --bin sepiola-lib -- retag ~/Photos sub/a.jpg 生日
@@ -25,13 +27,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 扫描库目录：新文件归类入库，图片自动分相册（人像/风景/建筑/美食/截图·文档等）
-    Scan {
-        /// 库根目录
+    /// 扫描文件类型并更新库索引，不运行图片/书籍内容分类
+    Scan { dir: String },
+    /// 仅对未处理的图片运行人像检测与相册分类
+    ClassifyImages {
         dir: String,
-        /// 配置文件（模型路径、阈值）；省略时使用默认值
         #[arg(short, long)]
         config: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// 仅对书籍提取内容级元数据；--retry-failed 重试之前未成功的条目
+    ExtractBooks {
+        dir: String,
+        #[arg(long)]
+        retry_failed: bool,
     },
     /// 列出相册与条目数
     Albums { dir: String },
@@ -55,13 +65,21 @@ fn main() {
     tracing_subscriber::fmt().with_max_level(Level::WARN).init();
     let cli = Cli::parse();
     let root = PathBuf::from(&match cli.command {
-        Command::Scan { ref dir, .. }
+        Command::Scan { ref dir }
+        | Command::ClassifyImages { ref dir, .. }
+        | Command::ExtractBooks { ref dir, .. }
         | Command::Albums { ref dir }
         | Command::List { ref dir, .. }
         | Command::Retag { ref dir, .. } => dir.clone(),
     });
     let result = match cli.command {
-        Command::Scan { config, .. } => run_scan(&root, config.as_deref()),
+        Command::Scan { .. } => run_scan(&root),
+        Command::ClassifyImages { config, force, .. } => {
+            run_classify_images(&root, config.as_deref(), force)
+        }
+        Command::ExtractBooks { retry_failed, .. } => {
+            run_extract_books(&root, retry_failed)
+        }
         Command::Albums { .. } => run_albums(&root),
         Command::List { album, .. } => run_list(&root, album.as_deref()),
         Command::Retag { rel, album, .. } => library::retag(&root, Path::new(&rel), &album)
@@ -73,11 +91,8 @@ fn main() {
     }
 }
 
-fn run_scan(root: &Path, config_path: Option<&str>) -> Result<()> {
-    let config = match config_path {
-        Some(path) => Config::load_file(&PathBuf::from(path))?,
-        None => Config::default(),
-    };
+fn run_scan(root: &Path) -> Result<()> {
+    let config = Config::default();
     let cancel = AtomicBool::new(false);
     let report = library::scan(root, &config, |event| {
         match event {
@@ -94,17 +109,46 @@ fn run_scan(root: &Path, config_path: Option<&str>) -> Result<()> {
         }
     }, &cancel)?;
     println!();
-    if report.detector_missing {
-        println!("提示：人脸模型不可用，图片已归入「未分类」；配好模型后重扫即可补归类");
-    }
     println!(
-        "扫描完成：新增 {}，移除 {}，图片归类 {}；索引 {}",
+        "类型扫描完成：新增 {}，移除 {}；索引 {}",
         report.added,
         report.removed,
-        report.classified,
         root.join(".sepiola").join("library.json").display()
     );
     run_albums(root)
+}
+
+fn run_classify_images(root: &Path, config_path: Option<&str>, force: bool) -> Result<()> {
+    let config = match config_path {
+        Some(path) => Config::load_file(&PathBuf::from(path))?,
+        None => Config::default(),
+    };
+    let cancel = AtomicBool::new(false);
+    let report = library::classify_images(root, &config, force, print_progress, &cancel)?;
+    println!("\n{}：{} 张{}", if force { "重新分类完成" } else { "图片分类完成" }, report.classified, if report.detector_missing {
+        "（人脸模型不可用，未处理图片保持原标签）"
+    } else {
+        ""
+    });
+    run_albums(root)
+}
+
+fn run_extract_books(root: &Path, retry_failed: bool) -> Result<()> {
+    let cancel = AtomicBool::new(false);
+    let report = library::extract_book_metadata(root, retry_failed, print_progress, &cancel)?;
+    println!("\n书籍元数据处理完成：{} 本", report.metadata_attempted);
+    Ok(())
+}
+
+fn print_progress(event: LibraryEvent) {
+    match event {
+        LibraryEvent::Discovered { total } => println!("发现 {total} 个待处理条目"),
+        LibraryEvent::Processed {
+            completed,
+            total,
+            rel_path,
+        } => print!("\x1b[2K\r  [{completed}/{total}] {}", rel_path.display()),
+    }
 }
 
 fn run_albums(root: &Path) -> Result<()> {

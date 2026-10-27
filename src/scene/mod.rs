@@ -5,6 +5,7 @@ use crate::imageio::ImageF32;
 
 pub mod face;
 pub mod landmark;
+pub mod mobileclip;
 pub mod places;
 pub mod stub;
 pub mod tags;

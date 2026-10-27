@@ -3,35 +3,26 @@
 use std::sync::atomic::Ordering;
 
 use eframe::egui;
-use sepiola::book::BookMeta;
 use sepiola::library::FileKind;
 
 use crate::assets::pointing_hand;
+use crate::book_filters::{field_value, BookField};
+use crate::books_table::show_books;
 use crate::library::LibraryPage;
 use crate::state::SepiolaApp;
 
-/// 可选字段转占位文本。
-fn dash<T: std::fmt::Display>(v: &Option<T>) -> String {
-    v.as_ref()
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "—".to_string())
-}
-
-/// 按书名（缺省用相对路径）排序后的书籍条目。
-fn sorted_books(app: &SepiolaApp) -> Vec<&sepiola::library::LibraryEntry> {
+/// 按书名（缺省用相对路径）排序后的索引。
+fn sorted_books(app: &SepiolaApp) -> Vec<usize> {
     let mut books: Vec<_> = app
         .library
         .index
         .entries
         .iter()
-        .filter(|entry| entry.kind == FileKind::Book)
+        .enumerate()
+        .filter_map(|(index, entry)| (entry.kind == FileKind::Book).then_some(index))
         .collect();
-    books.sort_by_cached_key(|entry| {
-        entry
-            .book_meta
-            .as_ref()
-            .and_then(|meta| meta.title.clone())
-            .unwrap_or_else(|| entry.rel_path.display().to_string())
+    books.sort_by_cached_key(|index| {
+        field_value(&app.library.index.entries[*index], BookField::Title).unwrap_or_default()
     });
     books
 }
@@ -49,32 +40,44 @@ impl SepiolaApp {
         }
         ui.separator();
 
-        let books = sorted_books(self);
-        if books.is_empty() {
-            ui.label("库中暂无书籍；扫描归类后自动解析 EPUB/FB2/MOBI/PDF 内容抽取元数据。");
+        let all_books = sorted_books(self);
+        if all_books.is_empty() {
+            ui.label("库中暂无书籍；先在总览扫描文件类型，再进入书籍页提取元数据。");
             return;
         }
-        let missing = books
+        if self.library.book_search.facets.is_empty() {
+            self.library
+                .book_search
+                .refresh_facets(&self.library.index.entries);
+        }
+        let missing = all_books
             .iter()
-            .filter(|entry| entry.book_meta.is_none())
+            .filter(|index| self.library.index.entries[**index].book_meta.is_none())
             .count();
+        let unattempted = all_books
+            .iter()
+            .filter(|index| {
+                let entry = &self.library.index.entries[**index];
+                entry.book_meta.is_none() && !entry.book_metadata_attempted
+            })
+            .count();
+        let failed = missing - unattempted;
         ui.label(format!(
-            "共 {} 本；{} 本尚无内容级元信息。",
-            books.len(),
-            missing
+            "共 {} 本；{} 本未尝试提取，{} 本提取失败。",
+            all_books.len(), unattempted, failed
         ));
-        let can_backfill_metadata = missing > 0 && self.library.index.version < 9;
-        let start_metadata_scan = if can_backfill_metadata {
-            pointing_hand(ui.add_enabled(
-                !self.library.scanning,
-                egui::Button::new("扫描并补全元信息"),
-            ))
-            .clicked()
-        } else {
-            false
-        };
-        let cancel_metadata_scan = self.library.scanning
-            && pointing_hand(ui.button("取消扫描")).clicked();
+        let start_metadata_scan = pointing_hand(ui.add_enabled(
+            !self.library.scanning && unattempted > 0,
+            egui::Button::new(format!("提取未处理书籍（{unattempted}）")),
+        ))
+        .clicked();
+        let retry_failed_scan = pointing_hand(ui.add_enabled(
+            !self.library.scanning && failed > 0,
+            egui::Button::new(format!("重试失败项（{failed}）")),
+        ))
+        .clicked();
+        let cancel_metadata_scan =
+            self.library.scanning && pointing_hand(ui.button("取消扫描")).clicked();
         if self.library.scanning {
             let (done, total) = self.library.progress;
             let fraction = if total == 0 {
@@ -88,89 +91,22 @@ impl SepiolaApp {
                     .text(format!("{done}/{total}")),
             );
         }
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .id_salt("books_view")
-            .show_rows(
-                ui,
-                ui.text_style_height(&egui::TextStyle::Body) + 4.0,
-                books.len() + 1,
-                |ui, rows| {
-                    let row_spacing = ui.spacing().item_spacing.y;
-                    egui::Grid::new("books_grid")
-                        .num_columns(8)
-                        .striped(true)
-                        .min_row_height(ui.text_style_height(&egui::TextStyle::Body) + 4.0)
-                        .max_col_width(210.0)
-                        .spacing([14.0, row_spacing])
-                        .start_row(rows.start)
-                        .show(ui, |ui| {
-                            for row in rows {
-                                if row == 0 {
-                                    for header in [
-                                        "书名",
-                                        "作者",
-                                        "出版社",
-                                        "年份",
-                                        "译者",
-                                        "版本",
-                                        "ISBN",
-                                        "文件",
-                                    ] {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(header).strong().size(15.0),
-                                            )
-                                            .truncate(),
-                                        );
-                                    }
-                                    ui.end_row();
-                                    continue;
-                                }
-                                let entry = books[row - 1];
-                                let empty = BookMeta::default();
-                                let meta = entry.book_meta.as_ref().unwrap_or(&empty);
-                                let file_name = entry
-                                    .rel_path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                let title = meta.title.clone().unwrap_or_else(|| {
-                                    entry
-                                        .rel_path
-                                        .file_stem()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_default()
-                                });
-                                ui.add(egui::Label::new(title).truncate());
-                                for value in [
-                                    dash(&meta.author),
-                                    dash(&meta.publisher),
-                                    dash(&meta.year),
-                                    dash(&meta.translator),
-                                    dash(&meta.edition),
-                                    dash(&meta.isbn),
-                                ] {
-                                    ui.add(egui::Label::new(value).truncate());
-                                }
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(file_name)
-                                            .weak()
-                                            .size(12.0)
-                                            .color(egui::Color32::from_gray(170)),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(entry.rel_path.display().to_string());
-                                ui.end_row();
-                            }
-                        });
-                },
-            );
-        drop(books);
+
+        let books = self.book_search_ui(ui, &all_books);
+        let total_books = self
+            .library
+            .index
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == FileKind::Book)
+            .count();
+        ui.label(format!("显示 {} / {} 本", books.len(), total_books));
+        show_books(ui, &self.library.index.entries, &books);
         if start_metadata_scan {
-            self.start_library_scan();
+            self.start_book_metadata_scan(false);
+        }
+        if retry_failed_scan {
+            self.start_book_metadata_scan(true);
         }
         if cancel_metadata_scan {
             self.library.cancel.store(true, Ordering::Relaxed);

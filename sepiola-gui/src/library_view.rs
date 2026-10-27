@@ -18,8 +18,61 @@ impl SepiolaApp {
             if pointing_hand(ui.button("← 返回总览")).clicked() {
                 self.library.page = LibraryPage::Overview;
             }
+            let pending = self
+                .library
+                .index
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == FileKind::Image
+                        && !entry.manual
+                        && entry.image_classification_version
+                            < sepiola::library::IMAGE_CLASSIFICATION_VERSION
+                })
+                .count();
+            if pointing_hand(ui.add_enabled(
+                !self.library.scanning && pending > 0,
+                egui::Button::new(format!("分类未处理图片（{pending}）")),
+            ))
+            .clicked()
+            {
+                self.start_image_classification();
+            }
+            let image_count = self
+                .library
+                .index
+                .entries
+                .iter()
+                .filter(|entry| entry.kind == FileKind::Image && !entry.manual)
+                .count();
+            if pointing_hand(ui.add_enabled(
+                !self.library.scanning && image_count > 0,
+                egui::Button::new("重新分类"),
+            ))
+            .clicked()
+            {
+                self.start_image_reclassification();
+            }
             self.develop_button_ui(ui);
         });
+        if self.library.scanning {
+            let (done, total) = self.library.progress;
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                done as f32 / total as f32
+            };
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .show_percentage()
+                        .text(format!("{done}/{total}")),
+                );
+                if pointing_hand(ui.button("取消当前任务")).clicked() {
+                    self.library.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
         self.develop_progress_ui(ui);
         if !self.library.message.is_empty() {
             ui.label(self.library.message.as_str());
@@ -27,14 +80,25 @@ impl SepiolaApp {
         ui.separator();
 
         let albums = self.library.index.albums();
+        let reset_counts = self.library.active_task
+            == Some(crate::library::LibraryTask::ReclassifyImages);
         // 内置相册全量展示（含 0 计数），自定义相册追加在后，保证新分类始终可见。
         let mut chips: Vec<(String, usize)> = library::ALL_ALBUMS
             .iter()
-            .map(|name| (name.to_string(), albums.get(*name).copied().unwrap_or(0)))
+            .map(|name| {
+                (
+                    name.to_string(),
+                    if reset_counts {
+                        0
+                    } else {
+                        albums.get(*name).copied().unwrap_or(0)
+                    },
+                )
+            })
             .collect();
         for (name, count) in &albums {
             if !library::ALL_ALBUMS.contains(&name.as_str()) {
-                chips.push((name.clone(), *count));
+                chips.push((name.clone(), if reset_counts { 0 } else { *count }));
             }
         }
         ui.horizontal_wrapped(|ui| {
