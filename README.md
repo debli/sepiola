@@ -1,2 +1,2 @@
 # sepiola (AI-powered)
-The app includes a RAW image converter and a document library.
+The app includes a RAW image converter, ebook reader, and a document library.
