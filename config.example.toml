@@ -5,13 +5,21 @@ jpeg_quality = 92
 workers = 4
 
 [portrait]
-stages = ["lut"]
+stages = ["look", "lut"]
+[portrait.look]
+preset = "warm"                                    # natural | warm | cinematic | vivid | matte | monochrome
+strength = 0.75
+exposure_ev = 0.1
 [portrait.lut]
 file = "luts/portrait.cube"
 strength = 0.4
 
 [other]
-stages = ["lut"]
+stages = ["look", "lut"]
+[other.look]
+preset = "cinematic"
+strength = 0.7
+exposure_ev = 0.0
 [other.lut]
 file = "luts/landscape.cube"
 strength = 0.7

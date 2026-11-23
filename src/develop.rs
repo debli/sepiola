@@ -25,6 +25,18 @@ pub fn is_raw_format(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 是否为 HEIC/HEIF 光栅图片（由 libheif 解码，不走 RAW 解码器）。
+pub fn is_heif_format(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "heic" | "heif"))
+}
+
+/// 是否可由显影入口处理的 RAW 或 HEIF 图片。
+pub fn is_developable_format(path: &Path) -> bool {
+    is_raw_format(path) || is_heif_format(path)
+}
+
 /// 实际使用的显影后端。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -90,7 +102,7 @@ pub fn raw_to_tiff(raw: &Path, out_dir: &Path, backend: Backend) -> Result<PathB
         std::fs::remove_file(&out_path)?;
     }
 
-    if backend == Backend::Builtin {
+    if backend == Backend::Builtin || is_heif_format(raw) {
         crate::builtin_develop::develop_to_tiff(raw, &out_path)?;
         return Ok(out_path);
     }
@@ -229,5 +241,14 @@ mod tests {
         assert!(is_raw_format(Path::new("b.dng")));
         assert!(!is_raw_format(Path::new("c.jpg")));
         assert!(!is_raw_format(Path::new("noext")));
+    }
+
+    #[test]
+    fn heif_formats_are_developable_but_not_raw() {
+        for path in [Path::new("a.HEIC"), Path::new("b.heif")] {
+            assert!(is_heif_format(path));
+            assert!(is_developable_format(path));
+            assert!(!is_raw_format(path));
+        }
     }
 }

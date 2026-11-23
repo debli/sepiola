@@ -11,7 +11,9 @@ fn dash<T: std::fmt::Display>(value: &Option<T>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-pub fn show_books(ui: &mut egui::Ui, entries: &[LibraryEntry], books: &[usize]) {
+/// 渲染书籍表格；返回被点击「阅读」的条目下标（`entries` 下标）。
+pub fn show_books(ui: &mut egui::Ui, entries: &[LibraryEntry], books: &[usize]) -> Option<usize> {
+    let mut clicked = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .id_salt("books_view")
@@ -21,10 +23,11 @@ pub fn show_books(ui: &mut egui::Ui, entries: &[LibraryEntry], books: &[usize]) 
             books.len() + 1,
             |ui, rows| {
                 let row_spacing = ui.spacing().item_spacing.y;
+                let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
                 egui::Grid::new("books_grid")
-                    .num_columns(8)
+                    .num_columns(9)
                     .striped(true)
-                    .min_row_height(ui.text_style_height(&egui::TextStyle::Body) + 4.0)
+                    .min_row_height(row_height)
                     .max_col_width(210.0)
                     .spacing([14.0, row_spacing])
                     .start_row(rows.start)
@@ -40,6 +43,7 @@ pub fn show_books(ui: &mut egui::Ui, entries: &[LibraryEntry], books: &[usize]) 
                                     "版本",
                                     "ISBN",
                                     "文件",
+                                    "阅读",
                                 ] {
                                     ui.add(
                                         egui::Label::new(
@@ -51,7 +55,8 @@ pub fn show_books(ui: &mut egui::Ui, entries: &[LibraryEntry], books: &[usize]) 
                                 ui.end_row();
                                 continue;
                             }
-                            let entry = &entries[books[row - 1]];
+                            let index = books[row - 1];
+                            let entry = &entries[index];
                             let empty = BookMeta::default();
                             let meta = entry.book_meta.as_ref().unwrap_or(&empty);
                             let file_name = entry
@@ -66,7 +71,15 @@ pub fn show_books(ui: &mut egui::Ui, entries: &[LibraryEntry], books: &[usize]) 
                                     .map(|name| name.to_string_lossy().into_owned())
                                     .unwrap_or_default()
                             });
-                            ui.add(egui::Label::new(title).truncate());
+                            let title_response = ui.add(
+                                egui::Label::new(title)
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            if title_response.clicked() {
+                                clicked = Some(index);
+                            }
+                            title_response.on_hover_text("点击阅读");
                             for value in [
                                 dash(&meta.author),
                                 dash(&meta.publisher),
@@ -87,9 +100,18 @@ pub fn show_books(ui: &mut egui::Ui, entries: &[LibraryEntry], books: &[usize]) 
                                 .truncate(),
                             )
                             .on_hover_text(entry.rel_path.display().to_string());
+                            if super::assets::pointing_hand(ui.add_sized(
+                                [64.0, row_height],
+                                egui::Button::new("阅读"),
+                            ))
+                            .clicked()
+                            {
+                                clicked = Some(index);
+                            }
                             ui.end_row();
                         }
                     });
             },
         );
+    clicked
 }

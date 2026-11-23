@@ -8,6 +8,7 @@ use crate::imageio::ImageF32;
 use crate::scene::SceneInfo;
 
 pub mod blend;
+pub mod look_stage;
 pub mod lut3d;
 pub mod lut_stage;
 pub mod stats;
@@ -30,6 +31,22 @@ pub fn build_stages(cfg: &SceneConfig) -> Result<Vec<Box<dyn Stage>>> {
     let mut stages: Vec<Box<dyn Stage>> = Vec::with_capacity(cfg.stages.len());
     for name in &cfg.stages {
         match name.as_str() {
+            "look" => {
+                let look_cfg = cfg.look.as_ref().ok_or_else(|| {
+                    Error::Config(
+                        "stage 'look' is listed but the scene has no look section".to_string(),
+                    )
+                })?;
+                let preset =
+                    look_stage::LookPreset::from_id(&look_cfg.preset).ok_or_else(|| {
+                        Error::Config(format!("unknown built-in look '{}'", look_cfg.preset))
+                    })?;
+                stages.push(Box::new(look_stage::LookStage::new(
+                    preset,
+                    look_cfg.strength,
+                    look_cfg.exposure_ev,
+                )));
+            }
             "lut" => {
                 let lut_cfg = cfg.lut.as_ref().ok_or_else(|| {
                     Error::Config(format!(
@@ -91,6 +108,7 @@ mod tests {
         let path = temp_cube("swap", SWAP_RB);
         let cfg = SceneConfig {
             stages: vec!["lut".to_string()],
+            look: None,
             lut: Some(LutConfig {
                 file: path.to_string_lossy().into_owned(),
                 strength: 0.5,
@@ -126,6 +144,7 @@ mod tests {
         let path = temp_cube("swap-scale", SWAP_RB);
         let cfg = SceneConfig {
             stages: vec!["lut".to_string()],
+            look: None,
             lut: Some(LutConfig {
                 file: path.to_string_lossy().into_owned(),
                 strength: 1.0,
@@ -158,6 +177,7 @@ mod tests {
     fn unknown_stage_is_rejected() {
         let cfg = SceneConfig {
             stages: vec!["sharpen".to_string()],
+            look: None,
             lut: None,
         };
         assert!(build_stages(&cfg).is_err());

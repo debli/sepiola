@@ -41,6 +41,257 @@ pub struct Config {
     /// `[scene_tags]`：ImageNet 场景标签，用于库相册细分。
     #[serde(default)]
     pub scene_tags: SceneTagSettings,
+    /// `[reader]`：电子书阅读器的外部能力配置。
+    #[serde(default)]
+    pub reader: ReaderSettings,
+}
+
+/// 阅读器配置。
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReaderSettings {
+    /// `[reader.ai]`：OpenAI 兼容接口，供翻译与 AI 解释使用。
+    #[serde(default)]
+    pub ai: ReaderAiSettings,
+    /// `[reader.dictionary]`：选中文字后调用的词典 URL / URI scheme。
+    #[serde(default)]
+    pub dictionary: ReaderDictionarySettings,
+}
+
+/// 词典跳转配置：`url` 为带 `{word}` 占位符的模板。
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReaderDictionarySettings {
+    /// 例如 `https://dict.youdao.com/result?word={word}` 或 `eudic://dict/{word}`。
+    #[serde(default)]
+    pub url: String,
+}
+
+impl ReaderDictionarySettings {
+    pub fn enabled(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+
+    /// 把选中文字填进模板；没有 `{word}` 占位符时追加到末尾。
+    pub fn target(&self, word: &str) -> String {
+        let encoded = percent_encode(word.trim());
+        let template = self.url.trim();
+        if template.contains("{word}") {
+            template.replace("{word}", &encoded)
+        } else {
+            format!("{template}{encoded}")
+        }
+    }
+}
+
+/// 只保留 RFC 3986 的非保留字符，其余按 UTF-8 字节做百分号编码。
+fn percent_encode(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for byte in text.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// AI 后端类型：Google Gemini 原生接口、OpenAI 兼容 HTTP 接口，或本地 CLI（如 Copilot CLI）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiProvider {
+    #[default]
+    Api,
+    Gemini,
+    Copilot,
+    Command,
+}
+
+impl AiProvider {
+    pub const ALL: [Self; 4] = [Self::Api, Self::Gemini, Self::Copilot, Self::Command];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Api => "api（HTTP 接口）",
+            Self::Gemini => "gemini（Google API）",
+            Self::Copilot => "copilot（CLI）",
+            Self::Command => "command（自定义命令）",
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
+            Self::Command => "command",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Self {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "gemini" => Self::Gemini,
+            "copilot" => Self::Copilot,
+            "command" => Self::Command,
+            _ => Self::Api,
+        }
+    }
+}
+
+fn default_cli_path() -> String {
+    "copilot".to_string()
+}
+
+fn default_cli_args() -> String {
+    "-p".to_string()
+}
+
+/// Copilot CLI 默认模型；可在设置页修改，或直接在 CLI 参数里写 `--model` 覆盖。
+fn default_cli_model() -> String {
+    "gpt-6-luna".to_string()
+}
+
+/// 可覆盖的提示词；字段留空时使用各功能内置的默认提示词。
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AiPrompts {
+    /// 选中文字的翻译。
+    pub translate: String,
+    /// 选中文字的 AI 解释。
+    pub explain: String,
+    /// 「分析本页」：需要保留 JSON 输出格式要求。
+    pub analyze: String,
+    /// 笔记本 AI 出题：需要保留 JSON 输出格式要求。
+    pub exercise: String,
+    /// 笔记本造句批改：需要保留 JSON 输出格式要求。
+    pub sentence: String,
+    /// 从分析结果生成记忆卡片：需要保留 JSON 输出格式要求。
+    pub card: String,
+    /// 针对分析条目继续追问。
+    pub chat: String,
+}
+
+fn custom_prompt(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+impl AiPrompts {
+    pub fn translate(&self) -> Option<&str> {
+        custom_prompt(&self.translate)
+    }
+
+    pub fn explain(&self) -> Option<&str> {
+        custom_prompt(&self.explain)
+    }
+
+    pub fn analyze(&self) -> Option<&str> {
+        custom_prompt(&self.analyze)
+    }
+
+    pub fn exercise(&self) -> Option<&str> {
+        custom_prompt(&self.exercise)
+    }
+
+    pub fn sentence(&self) -> Option<&str> {
+        custom_prompt(&self.sentence)
+    }
+
+    pub fn card(&self) -> Option<&str> {
+        custom_prompt(&self.card)
+    }
+
+    pub fn chat(&self) -> Option<&str> {
+        custom_prompt(&self.chat)
+    }
+}
+
+/// AI 后端配置：HTTP 接口或外部 CLI；阅读器与笔记本共用。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ReaderAiSettings {
+    /// 后端类型：`api` / `gemini` / `copilot` / `command`。
+    pub provider: AiProvider,
+    /// 例如 `https://api.openai.com/v1`，实际请求 `{base_url}/chat/completions`；
+    /// Gemini 后端留空时使用官方地址 `https://generativelanguage.googleapis.com`。
+    pub base_url: String,
+    pub api_key: String,
+    /// 例如 `gpt-4o-mini`。
+    pub model: String,
+    /// CLI 可执行文件路径（默认 `copilot`）。
+    #[serde(default = "default_cli_path")]
+    pub cli_path: String,
+    /// CLI 参数，提示词作为最后一个 argv 追加；默认 `-p`。
+    #[serde(default = "default_cli_args")]
+    pub cli_args: String,
+    /// Copilot CLI 使用的模型（通过 `--model` 传入）；默认 `gpt-6-luna`。
+    #[serde(default = "default_cli_model")]
+    pub cli_model: String,
+    /// HTTP 代理地址（如 `http://127.0.0.1:7890`），作用于 AI HTTP 接口与 CLI 子进程；留空不使用。
+    #[serde(default)]
+    pub proxy_http: String,
+    /// HTTPS 代理地址；留空时回退 `proxy_http`。
+    #[serde(default)]
+    pub proxy_https: String,
+    /// `[reader.ai.prompts]`：各功能的提示词覆盖。
+    #[serde(default)]
+    pub prompts: AiPrompts,
+}
+
+impl Default for ReaderAiSettings {
+    fn default() -> Self {
+        Self {
+            provider: AiProvider::Api,
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            cli_path: default_cli_path(),
+            cli_args: default_cli_args(),
+            cli_model: default_cli_model(),
+            proxy_http: String::new(),
+            proxy_https: String::new(),
+            prompts: AiPrompts::default(),
+        }
+    }
+}
+
+impl ReaderAiSettings {
+    pub fn enabled(&self) -> bool {
+        match self.provider {
+            AiProvider::Api => {
+                !self.base_url.trim().is_empty() && !self.model.trim().is_empty()
+            }
+            AiProvider::Gemini => {
+                !self.api_key.trim().is_empty() && !self.model.trim().is_empty()
+            }
+            AiProvider::Copilot | AiProvider::Command => {
+                !self.cli_path.trim().is_empty()
+            }
+        }
+    }
+
+    /// CLI 路径（留空时回退到默认的 `copilot`）。
+    pub fn cli_path(&self) -> &str {
+        let path = self.cli_path.trim();
+        if path.is_empty() {
+            "copilot"
+        } else {
+            path
+        }
+    }
+
+    /// Copilot 模型（留空时回退到 `gpt-6-luna`）。
+    pub fn cli_model(&self) -> &str {
+        let model = self.cli_model.trim();
+        if model.is_empty() {
+            "gpt-6-luna"
+        } else {
+            model
+        }
+    }
 }
 
 /// 单个场景的 Stage 列表及各自的参数。
@@ -50,7 +301,18 @@ pub struct SceneConfig {
     #[serde(default)]
     pub stages: Vec<String>,
     #[serde(default)]
+    pub look: Option<LookConfig>,
+    #[serde(default)]
     pub lut: Option<LutConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LookConfig {
+    pub preset: String,
+    #[serde(default = "default_strength")]
+    pub strength: f32,
+    #[serde(default)]
+    pub exposure_ev: f32,
 }
 
 /// `lut` Stage 的参数。
@@ -402,6 +664,7 @@ impl Default for Config {
             output: OutputSettings::default(),
             identity: IdentitySettings::default(),
             scene_tags: SceneTagSettings::default(),
+            reader: ReaderSettings::default(),
         }
     }
 }
@@ -486,6 +749,26 @@ impl Config {
             )));
         }
         for (name, scene) in [("portrait", &self.portrait), ("other", &self.other)] {
+            if let Some(look) = &scene.look {
+                if crate::grade::look_stage::LookPreset::from_id(&look.preset).is_none() {
+                    return Err(Error::Config(format!(
+                        "{name}.look.preset is not a supported built-in look: '{}'",
+                        look.preset
+                    )));
+                }
+                if !look.strength.is_finite() || !(0.0..=1.0).contains(&look.strength) {
+                    return Err(Error::Config(format!(
+                        "{name}.look.strength must be 0.0..=1.0, got {}",
+                        look.strength
+                    )));
+                }
+                if !look.exposure_ev.is_finite() || !(-5.0..=5.0).contains(&look.exposure_ev) {
+                    return Err(Error::Config(format!(
+                        "{name}.look.exposure_ev must be -5.0..=5.0, got {}",
+                        look.exposure_ev
+                    )));
+                }
+            }
             if let Some(lut) = &scene.lut {
                 if !lut.strength.is_finite() || !(0.0..=1.0).contains(&lut.strength) {
                     return Err(Error::Config(format!(
@@ -617,10 +900,31 @@ mod tests {
     #[test]
     fn example_config_parses_and_validates() {
         let config = Config::from_toml(EXAMPLE).expect("example config should parse");
-        assert_eq!(config.portrait.stages, vec!["lut".to_string()]);
-        assert_eq!(config.other.stages, vec!["lut".to_string()]);
+        assert_eq!(
+            config.portrait.stages,
+            vec!["look".to_string(), "lut".to_string()]
+        );
+        assert_eq!(
+            config.other.stages,
+            vec!["look".to_string(), "lut".to_string()]
+        );
         assert!(config.safety.max_clipped_high > 0.0);
         assert!(config.workers >= 1);
+    }
+
+    #[test]
+    fn reader_ai_prompts_default_to_empty_and_parse_overrides() {
+        let config: Config = toml::from_str("").expect("parse empty");
+        assert!(config.reader.ai.prompts.explain.is_empty());
+        assert_eq!(config.reader.ai.prompts.explain(), None);
+
+        let config: Config = toml::from_str(
+            "[reader.ai.prompts]\nexplain = \" 用英文解释。 \"\nanalyze = \"自定义\"\n",
+        )
+        .expect("parse prompts");
+        assert_eq!(config.reader.ai.prompts.explain(), Some("用英文解释。"));
+        assert_eq!(config.reader.ai.prompts.analyze(), Some("自定义"));
+        assert_eq!(config.reader.ai.prompts.translate(), None);
     }
 
     #[test]
@@ -648,6 +952,48 @@ mod tests {
                    config.other.lut.as_ref().map(|l| l.strength));
         // `[scene]` 重命名对序列化同样生效。
         assert!(text.contains("[scene]"));
+    }
+
+    #[test]
+    fn dictionary_target_fills_and_encodes_word() {
+        let settings = ReaderDictionarySettings {
+            url: "eudic://dict/{word}".to_string(),
+        };
+        assert!(settings.enabled());
+        assert_eq!(settings.target("  hello "), "eudic://dict/hello");
+
+        let settings = ReaderDictionarySettings {
+            url: "https://dict.example/?q={word}".to_string(),
+        };
+        assert_eq!(
+            settings.target("中文 A&B"),
+            "https://dict.example/?q=%E4%B8%AD%E6%96%87%20A%26B"
+        );
+
+        // 没写占位符时追加到末尾。
+        let settings = ReaderDictionarySettings {
+            url: "https://dict.example/?q=".to_string(),
+        };
+        assert_eq!(settings.target("hi"), "https://dict.example/?q=hi");
+
+        assert!(!ReaderDictionarySettings::default().enabled());
+    }
+
+    #[test]
+    fn dictionary_settings_round_trip() {
+        let config = Config::from_toml(
+            r#"
+input_dir = "in"
+output_dir = "out"
+
+[reader.dictionary]
+url = "eudic://dict/{word}"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(config.reader.dictionary.target("word"), "eudic://dict/word");
+        let text = config.to_toml().expect("serialize");
+        assert!(text.contains("[reader.dictionary]"));
     }
 
     #[test]

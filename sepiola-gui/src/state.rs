@@ -9,7 +9,11 @@ use eframe::egui;
 use sepiola::config::{Config, IdentitySettings, SceneConfig};
 use sepiola::scene::SceneKind;
 
-use crate::assets::{discover_model, install_cjk_font, scene_config};
+use crate::album_view::AlbumState;
+use crate::assets::{
+    build_look_previews, discover_model, install_cjk_font, scene_config, LookPreview,
+};
+use crate::compare::CompareState;
 use crate::library::{non_empty_root, LibraryState, Tab};
 use crate::user_settings::UserSettings;
 use crate::worker::UiMessage;
@@ -90,6 +94,8 @@ pub struct Preview {
 pub struct SepiolaApp {
     pub tab: Tab,
     pub library: LibraryState,
+    pub compare: CompareState,
+    pub album: Arc<std::sync::Mutex<AlbumState>>,
     pub user_settings: UserSettings,
     pub input_dir: String,
     pub output_dir: String,
@@ -101,8 +107,15 @@ pub struct SepiolaApp {
     pub model_path: String,
     pub portrait_lut: String,
     pub portrait_strength: f32,
+    pub portrait_look: String,
+    pub portrait_look_strength: f32,
+    pub portrait_exposure_ev: f32,
     pub other_lut: String,
     pub other_strength: f32,
+    pub other_look: String,
+    pub other_look_strength: f32,
+    pub other_exposure_ev: f32,
+    pub look_previews: Vec<LookPreview>,
     pub pixel_format: PixelFormat,
     pub keep_metadata: bool,
     pub identity_enabled: bool,
@@ -124,6 +137,14 @@ pub struct SepiolaApp {
     pub preview: Option<Preview>,
     pub zoom_open: bool,
     pub zoom_scale: f32,
+    /// 阅读窗口是否打开（独立窗口，不影响库页当前页签）。
+    pub reader_window: bool,
+    /// AI 设置页的 CLI 探测结果（后台线程）。
+    pub ai_probe: Option<Receiver<Result<String, String>>>,
+    /// AI 用量缓存（日志修改时间, 汇总），避免设置页每帧重读日志。
+    pub ai_usage: Option<(std::time::SystemTime, sepiola::ai::UsageSummary)>,
+    /// 记忆卡片笔记本。
+    pub notebook: crate::notebook_view::NotebookState,
     /// 正在管理人物标签的行号。
     pub person_edit: Option<usize>,
     pub person_edit_text: String,
@@ -131,6 +152,8 @@ pub struct SepiolaApp {
     pub merge_target: String,
     /// 删除人物时是否同时删除输出目录。
     pub remove_delete_dir: bool,
+    /// 弹窗内 Markdown 文字的 label 选区（由 egui 插件在帧末写入）。
+    pub label_selection: crate::reader_selection::LabelSelectionSink,
 }
 
 impl SepiolaApp {
@@ -140,6 +163,8 @@ impl SepiolaApp {
             style.spacing.item_spacing = egui::vec2(14.0, 10.0);
             // 按钮/下拉框/输入框的内边距：直接决定这些控件的高度与观感大小。
             style.spacing.button_padding = egui::vec2(14.0, 8.0);
+            // 悬停可点击按钮时统一显示手型光标（egui 0.37 的 Button 原生支持）。
+            style.visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
         });
         let user_settings = UserSettings::load_or_default();
         let tab = if user_settings.library_root.trim().is_empty() {
@@ -165,10 +190,7 @@ impl SepiolaApp {
             discover_model(&user_settings.model_path, "face_detection_yunet")
         };
         let identity_model = if user_settings.identity_model.trim().is_empty() {
-            discover_model(
-                "models/arcfaceresnet100-11-int8.onnx",
-                "arcfaceresnet100",
-            )
+            discover_model("models/arcfaceresnet100-11-int8.onnx", "arcfaceresnet100")
         } else {
             discover_model(&user_settings.identity_model, "arcfaceresnet100")
         };
@@ -177,9 +199,22 @@ impl SepiolaApp {
         } else {
             discover_model(&user_settings.landmark_model, "2d106det")
         };
+        let look_previews = build_look_previews(&cc.egui_ctx);
+        let merged = crate::reader::merged_reader_settings(&user_settings);
+        library.reader.ai = merged.ai.clone();
+        library.reader.dictionary = merged.dictionary;
+        let mut notebook = crate::notebook_view::NotebookState::default();
+        if let Some(root) = non_empty_root(&library.root) {
+            notebook.reload(&root, merged.ai);
+        }
+        let label_selection = crate::reader_selection::LabelSelectionSink::default();
+        cc.egui_ctx.add_plugin(label_selection.clone());
         Self {
+            label_selection,
             tab,
             library,
+            compare: CompareState::default(),
+            album: Arc::new(std::sync::Mutex::new(AlbumState::default())),
             user_settings: user_settings.clone(),
             input_dir: user_settings.input_dir.clone(),
             output_dir: user_settings.output_dir.clone(),
@@ -198,8 +233,15 @@ impl SepiolaApp {
             model_path,
             portrait_lut: user_settings.portrait_lut.clone(),
             portrait_strength: user_settings.portrait_strength.clamp(0.0, 1.0),
+            portrait_look: user_settings.portrait_look.clone(),
+            portrait_look_strength: user_settings.portrait_look_strength.clamp(0.0, 1.0),
+            portrait_exposure_ev: user_settings.portrait_exposure_ev.clamp(-5.0, 5.0),
             other_lut: user_settings.other_lut.clone(),
             other_strength: user_settings.other_strength.clamp(0.0, 1.0),
+            other_look: user_settings.other_look.clone(),
+            other_look_strength: user_settings.other_look_strength.clamp(0.0, 1.0),
+            other_exposure_ev: user_settings.other_exposure_ev.clamp(-5.0, 5.0),
+            look_previews,
             pixel_format: match user_settings.pixel_format.as_str() {
                 "16bit" => PixelFormat::Bit16,
                 _ => PixelFormat::Bit8,
@@ -222,6 +264,10 @@ impl SepiolaApp {
             preview: None,
             zoom_open: false,
             zoom_scale: 1.0,
+            reader_window: false,
+            ai_probe: None,
+            ai_usage: None,
+            notebook,
             person_edit: None,
             person_edit_text: String::new(),
             merge_target: String::new(),
@@ -241,8 +287,14 @@ impl SepiolaApp {
             model_path: self.model_path.clone(),
             portrait_lut: self.portrait_lut.clone(),
             portrait_strength: self.portrait_strength,
+            portrait_look: self.portrait_look.clone(),
+            portrait_look_strength: self.portrait_look_strength,
+            portrait_exposure_ev: self.portrait_exposure_ev,
             other_lut: self.other_lut.clone(),
             other_strength: self.other_strength,
+            other_look: self.other_look.clone(),
+            other_look_strength: self.other_look_strength,
+            other_exposure_ev: self.other_exposure_ev,
             pixel_format: self.pixel_format.as_str().to_string(),
             keep_metadata: self.keep_metadata,
             identity_enabled: self.identity_enabled,
@@ -252,6 +304,23 @@ impl SepiolaApp {
             gallery_file: self.gallery_file.clone(),
             library_root: self.library.root.clone(),
             recent_library_roots: self.user_settings.recent_library_roots.clone(),
+            dictionary_url: self.user_settings.dictionary_url.clone(),
+            ai_provider: self.user_settings.ai_provider.clone(),
+            proxy_http: self.user_settings.proxy_http.clone(),
+            proxy_https: self.user_settings.proxy_https.clone(),
+            ai_base_url: self.user_settings.ai_base_url.clone(),
+            ai_api_key: self.user_settings.ai_api_key.clone(),
+            ai_model: self.user_settings.ai_model.clone(),
+            ai_cli_path: self.user_settings.ai_cli_path.clone(),
+            ai_cli_args: self.user_settings.ai_cli_args.clone(),
+            ai_cli_model: self.user_settings.ai_cli_model.clone(),
+            ai_prompt_translate: self.user_settings.ai_prompt_translate.clone(),
+            ai_prompt_explain: self.user_settings.ai_prompt_explain.clone(),
+            ai_prompt_analyze: self.user_settings.ai_prompt_analyze.clone(),
+            ai_prompt_exercise: self.user_settings.ai_prompt_exercise.clone(),
+            ai_prompt_sentence: self.user_settings.ai_prompt_sentence.clone(),
+            ai_prompt_card: self.user_settings.ai_prompt_card.clone(),
+            ai_prompt_chat: self.user_settings.ai_prompt_chat.clone(),
         };
         settings.record_active_library_if_changed(&self.user_settings.library_root);
         if settings != self.user_settings {
@@ -274,8 +343,20 @@ impl SepiolaApp {
         config.scene_settings.classifier = self.classifier.as_str().to_string();
         config.scene_settings.model = self.model_path.trim().to_string();
         config.safety.max_clipped_high = self.max_clipped_high;
-        config.portrait = scene_config(&self.portrait_lut, self.portrait_strength);
-        config.other = scene_config(&self.other_lut, self.other_strength);
+        config.portrait = scene_config(
+            &self.portrait_lut,
+            self.portrait_strength,
+            &self.portrait_look,
+            self.portrait_look_strength,
+            self.portrait_exposure_ev,
+        );
+        config.other = scene_config(
+            &self.other_lut,
+            self.other_strength,
+            &self.other_look,
+            self.other_look_strength,
+            self.other_exposure_ev,
+        );
         config.output.pixel_format = self.pixel_format.as_str().to_string();
         config.output.keep_metadata = self.keep_metadata;
         config.identity.enabled = self.identity_enabled;
@@ -306,8 +387,22 @@ impl SepiolaApp {
             "stub" => ClassifierChoice::Stub,
             _ => ClassifierChoice::Face,
         };
-        apply_scene(&config.portrait, &mut self.portrait_lut, &mut self.portrait_strength);
-        apply_scene(&config.other, &mut self.other_lut, &mut self.other_strength);
+        apply_scene(
+            &config.portrait,
+            &mut self.portrait_lut,
+            &mut self.portrait_strength,
+            &mut self.portrait_look,
+            &mut self.portrait_look_strength,
+            &mut self.portrait_exposure_ev,
+        );
+        apply_scene(
+            &config.other,
+            &mut self.other_lut,
+            &mut self.other_strength,
+            &mut self.other_look,
+            &mut self.other_look_strength,
+            &mut self.other_exposure_ev,
+        );
         self.max_clipped_high = config.safety.max_clipped_high;
         self.pixel_format = match config.output.pixel_format.as_str() {
             "16bit" => PixelFormat::Bit16,
@@ -316,8 +411,7 @@ impl SepiolaApp {
         self.keep_metadata = config.output.keep_metadata;
         self.apply_identity(&config.identity);
         if !config.scene_settings.model.trim().is_empty() {
-            self.model_path =
-                discover_model(&config.scene_settings.model, "face_detection_yunet");
+            self.model_path = discover_model(&config.scene_settings.model, "face_detection_yunet");
         }
     }
 
@@ -338,7 +432,14 @@ impl SepiolaApp {
 }
 
 /// 场景配置 → 界面字段（无 LUT 时清空路径与强度）。
-fn apply_scene(scene: &SceneConfig, lut: &mut String, strength: &mut f32) {
+fn apply_scene(
+    scene: &SceneConfig,
+    lut: &mut String,
+    strength: &mut f32,
+    preset: &mut String,
+    look_strength: &mut f32,
+    exposure_ev: &mut f32,
+) {
     match &scene.lut {
         Some(config) => {
             *lut = config.file.clone();
@@ -347,5 +448,12 @@ fn apply_scene(scene: &SceneConfig, lut: &mut String, strength: &mut f32) {
         None => {
             lut.clear();
         }
+    }
+    if let Some(config) = &scene.look {
+        *preset = config.preset.clone();
+        *look_strength = config.strength;
+        *exposure_ev = config.exposure_ev;
+    } else {
+        preset.clear();
     }
 }

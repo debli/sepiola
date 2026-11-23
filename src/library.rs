@@ -8,8 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::book::{self, BookMeta};
@@ -66,10 +68,10 @@ static DEVELOP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "avi", "wmv", "flv", "webm", "m4v"];
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus", "amr"];
 const DOCUMENT_EXTENSIONS: &[&str] = &[
-    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "wps", "txt", "md", "markdown", "rtf", "odt",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "wps", "md", "markdown", "rtf", "odt",
 ];
 const BOOK_EXTENSIONS: &[&str] = &[
-    "epub", "pdf", "mobi", "azw3", "asw3", "azw", "fb2", "djvu",
+    "epub", "pdf", "mobi", "azw3", "asw3", "azw", "fb2", "djvu", "txt",
 ];
 const DRIVER_EXTENSIONS: &[&str] = &["inf", "sys", "cat"];
 const INSTALLER_EXTENSIONS: &[&str] = &[
@@ -78,7 +80,8 @@ const INSTALLER_EXTENSIONS: &[&str] = &[
 const ARCHIVE_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "gz", "bz2", "xz"];
 /// 音频扩展名 + 文件名含以下关键词时判为"录音"（语音备忘、通话记录等）。
 const RECORDING_KEYWORDS: &[&str] = &["录音", "record", "rec_", "voice", "speech", "通话", "voicemail"];
-pub const IMAGE_CLASSIFICATION_VERSION: u32 = 1;
+/// 图片相册分类规则版本；规则变化时递增以触发旧库重归类。
+pub const IMAGE_CLASSIFICATION_VERSION: u32 = 4;
 
 /// 项目目录标记（全小写，与目录项小写名比较）：命中其一即把整个目录折叠为一个
 /// "项目"实体，内部文件不再单独入库。
@@ -250,12 +253,18 @@ pub struct LibraryEntry {
     /// 书籍内容级元数据（M36），仅 Book 类型扫描时抽取。
     #[serde(default)]
     pub book_meta: Option<BookMeta>,
+    /// 音频标签元数据（M41），仅 Audio/Recording 类型扫描时抽取。
+    #[serde(default)]
+    pub audio_meta: Option<crate::audio::AudioMeta>,
     /// 图片相册分类器版本；旧索引默认 0，进入图片库时按需补分类。
     #[serde(default)]
     pub image_classification_version: u32,
     /// 书籍元数据是否已经尝试提取（失败也记录，避免反复解析/告警）。
     #[serde(default)]
     pub book_metadata_attempted: bool,
+    /// 音频元数据是否已经尝试提取。
+    #[serde(default)]
+    pub audio_metadata_attempted: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -350,6 +359,7 @@ pub struct ScanReport {
     pub removed: usize,
     pub classified: usize,
     pub metadata_attempted: usize,
+    pub cancelled: bool,
     /// 人脸模型缺失、图片落入"未分类"时为 true。
     pub detector_missing: bool,
 }
@@ -369,13 +379,19 @@ where
     }
     let mut files: Vec<PathBuf> = Vec::new();
     let mut entities: Vec<(PathBuf, FileKind)> = Vec::new();
-    walk(root, root, &mut files, &mut entities)?;
+    if walk(root, root, &mut files, &mut entities, cancel)? {
+        on_event(LibraryEvent::Discovered { total: 0 });
+        return Ok(ScanReport {
+            cancelled: true,
+            ..ScanReport::default()
+        });
+    }
     files.sort();
     entities.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut index = LibraryIndex::load(root)?;
-    // v8 迁移文件类型；重型任务由类型页按条目状态触发。
-    let reclass_file_kinds = index.version < 8;
+    // v9 迁移文件类型（TXT 归入书籍）；重型任务由类型页按条目状态触发。
+    let reclass_file_kinds = index.version < 9;
     let known: std::collections::HashSet<PathBuf> =
         index.entries.iter().map(|entry| entry.rel_path.clone()).collect();
     let still_present: std::collections::HashSet<PathBuf> =
@@ -424,6 +440,7 @@ where
         classified: 0,
         metadata_attempted: 0,
         detector_missing: false,
+        cancelled: false,
     };
     let mut interrupted = false;
     for (completed, (rel, entity, is_new)) in pending.iter().enumerate() {
@@ -458,8 +475,10 @@ where
                 person,
                 manual: false,
                 book_meta,
+                audio_meta: None,
                 image_classification_version: 0,
                 book_metadata_attempted: false,
+                audio_metadata_attempted: false,
             });
             report.added += 1;
         } else if let Some(entry) = index.find_mut(rel) {
@@ -467,8 +486,10 @@ where
             entry.album = album;
             entry.person = person;
             entry.book_meta = book_meta;
+            entry.audio_meta = None;
             entry.image_classification_version = 0;
             entry.book_metadata_attempted = false;
+            entry.audio_metadata_attempted = false;
         }
         on_event(LibraryEvent::Processed {
             completed: completed + 1,
@@ -476,13 +497,14 @@ where
             rel_path: rel.clone(),
         });
     }
+    report.cancelled = interrupted;
 
     index.entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     if !interrupted {
         index.version = if reclass_file_kinds {
-            8
+            9
         } else {
-            index.version.max(8)
+            index.version.max(9)
         };
     }
     index.save(root)?;
@@ -523,6 +545,7 @@ where
     let detector_missing = total > 0 && !cancel.load(Ordering::Relaxed) && detector.is_none();
     let mut report = ScanReport {
         detector_missing,
+        cancelled: cancel.load(Ordering::Relaxed),
         ..ScanReport::default()
     };
     if detector.is_none() {
@@ -584,6 +607,7 @@ where
             rel_path: rel.clone(),
         });
     }
+    report.cancelled = cancel.load(Ordering::Relaxed);
     index.save(root)?;
     Ok(report)
 }
@@ -596,7 +620,7 @@ pub fn extract_book_metadata<F>(
     cancel: &AtomicBool,
 ) -> Result<ScanReport>
 where
-    F: Fn(LibraryEvent),
+    F: Fn(LibraryEvent) + Sync,
 {
     let mut index = LibraryIndex::load(root)?;
     let pending: Vec<PathBuf> = index
@@ -614,22 +638,115 @@ where
     on_event(LibraryEvent::Discovered { total });
     let mut report = ScanReport::default();
 
-    for (completed, rel) in pending.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let metadata = book::extract(&root.join(rel));
+    let available_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    // 书籍解析（尤其大 PDF）内存与耗时都很高，限制并发以缩短取消等待并控制峰值内存。
+    let worker_count = (available_threads / 2).max(1).min(2);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()
+        .map_err(|error| Error::ThreadPool(error.to_string()))?;
+    let completed = AtomicUsize::new(0);
+    let progress_lock = Mutex::new(());
+    let extracted: Vec<_> = pool.install(|| {
+        pending
+            .par_iter()
+            .filter_map(|rel| {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let metadata = book::extract_cancellable(&root.join(rel), cancel);
+                // 取消后丢弃收尾中的结果，不再推进进度。
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let _progress_guard = progress_lock.lock().expect("progress lock poisoned");
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                on_event(LibraryEvent::Processed {
+                    completed: done,
+                    total,
+                    rel_path: rel.clone(),
+                });
+                Some((rel, metadata))
+            })
+            .collect()
+    });
+    for (rel, metadata) in extracted {
         if let Some(entry) = index.find_mut(rel) {
             entry.book_meta = metadata;
             entry.book_metadata_attempted = true;
             report.metadata_attempted += 1;
         }
-        on_event(LibraryEvent::Processed {
-            completed: completed + 1,
-            total,
-            rel_path: rel.clone(),
-        });
     }
+    report.cancelled = cancel.load(Ordering::Relaxed);
+    index.save(root)?;
+    Ok(report)
+}
+
+/// Extract metadata for audio and recording entries; parsing is deferred until requested.
+pub fn extract_audio_metadata<F>(
+    root: &Path,
+    retry_failed: bool,
+    on_event: F,
+    cancel: &AtomicBool,
+) -> Result<ScanReport>
+where
+    F: Fn(LibraryEvent) + Sync,
+{
+    let mut index = LibraryIndex::load(root)?;
+    let pending: Vec<PathBuf> = index
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(entry.kind, FileKind::Audio | FileKind::Recording)
+                && entry.audio_meta.is_none()
+                && (!entry.audio_metadata_attempted || retry_failed)
+        })
+        .map(|entry| entry.rel_path.clone())
+        .collect();
+    let total = pending.len();
+    on_event(LibraryEvent::Discovered { total });
+    let mut report = ScanReport::default();
+
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .div_ceil(2)
+        .max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_count)
+        .build()
+        .map_err(|error| Error::ThreadPool(error.to_string()))?;
+    let completed = AtomicUsize::new(0);
+    let progress_lock = Mutex::new(());
+    let extracted: Vec<_> = pool.install(|| {
+        pending
+            .par_iter()
+            .filter_map(|rel| {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let metadata = crate::audio::AudioMeta::extract(&root.join(rel));
+                let _progress_guard = progress_lock.lock().expect("progress lock poisoned");
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                on_event(LibraryEvent::Processed {
+                    completed: done,
+                    total,
+                    rel_path: rel.clone(),
+                });
+                Some((rel, metadata))
+            })
+            .collect()
+    });
+    for (rel, metadata) in extracted {
+        if let Some(entry) = index.find_mut(rel) {
+            entry.audio_meta = metadata;
+            entry.audio_metadata_attempted = true;
+            report.metadata_attempted += 1;
+        }
+    }
+    report.cancelled = cancel.load(Ordering::Relaxed);
     index.save(root)?;
     Ok(report)
 }
@@ -668,6 +785,10 @@ fn auto_album(
         return (ALBUM_PORTRAIT.to_string(), person);
     }
     let unclassified = || (ALBUM_UNCLASSIFIED.to_string(), None);
+    // 书页线稿/图表：近白底 + 少量深色笔画，场景模型常误判为建筑/风景。
+    if looks_like_printed_page(&image) {
+        return (ALBUM_SCREEN_DOC.to_string(), None);
+    }
     if let Some(mobileclip) = mobileclip {
         match mobileclip.tag(&image) {
             Ok(Some(tag)) => return (tag.album.to_string(), None),
@@ -700,6 +821,39 @@ fn auto_album(
         }
     }
     unclassified()
+}
+
+/// 判断是否像印刷页/线稿：几乎无彩色、大面积浅底、深色笔画占比较少。
+/// 用于避免 Places365 把白底线框图误判为建筑（如“skyscraper”）。
+fn looks_like_printed_page(image: &crate::imageio::ImageF32) -> bool {
+    let pixels = image.width as usize * image.height as usize;
+    if pixels == 0 || image.data.len() < pixels * crate::imageio::CHANNELS {
+        return false;
+    }
+    let mut colored = 0usize;
+    let mut light = 0usize;
+    let mut dark = 0usize;
+    for i in 0..pixels {
+        let base = i * crate::imageio::CHANNELS;
+        let r = image.data[base];
+        let g = image.data[base + 1];
+        let b = image.data[base + 2];
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        if max - min > 0.06 {
+            colored += 1;
+        }
+        let lum = (r + g + b) / 3.0;
+        if lum > 0.8 {
+            light += 1;
+        } else if lum < 0.35 {
+            dark += 1;
+        }
+    }
+    let pixel_count = pixels as f32;
+    colored as f32 / pixel_count <= 0.02
+        && light as f32 / pixel_count >= 0.5
+        && dark as f32 / pixel_count <= 0.35
 }
 
 /// 从索引移除条目（不删除磁盘文件）。返回是否实际移除。
@@ -783,10 +937,22 @@ pub fn retag(root: &Path, rel: &Path, album: &str) -> Result<()> {
     index.save(root)
 }
 
-fn walk(root: &Path, dir: &Path, files: &mut Vec<PathBuf>, entities: &mut Vec<(PathBuf, FileKind)>) -> Result<()> {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    entities: &mut Vec<(PathBuf, FileKind)>,
+    cancel: &AtomicBool,
+) -> Result<bool> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(true);
+    }
     let entries = std::fs::read_dir(dir)
         .map_err(|e| Error::Config(format!("failed to read {}: {e}", dir.display())))?;
     for entry in entries {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
         let path = entry
             .map_err(|e| Error::Config(format!("failed to read entry in {}: {e}", dir.display())))?
             .path();
@@ -803,12 +969,14 @@ fn walk(root: &Path, dir: &Path, files: &mut Vec<PathBuf>, entities: &mut Vec<(P
                 ));
                 continue;
             }
-            walk(root, &path, files, entities)?;
+            if walk(root, &path, files, entities, cancel)? {
+                return Ok(true);
+            }
         } else if path.is_file() {
             files.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -823,6 +991,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sepiola-lib-{tag}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("create temp root");
         dir
+    }
+
+    #[test]
+    fn printed_page_detection_rejects_line_art_on_white() {
+        let size = 64usize;
+        let mut data = vec![0.95f32; size * size * crate::imageio::CHANNELS];
+        // 横竖若干细线模拟线框图。
+        for y in 8..size - 8 {
+            if y % 8 == 0 {
+                for x in 8..size - 8 {
+                    let i = (y * size + x) * crate::imageio::CHANNELS;
+                    data[i..i + 3].fill(0.1);
+                }
+            }
+        }
+        let image = crate::imageio::ImageF32 {
+            width: size as u32,
+            height: size as u32,
+            data,
+        };
+        assert!(looks_like_printed_page(&image));
+
+        let colored = crate::imageio::ImageF32 {
+            width: 2,
+            height: 2,
+            data: vec![0.9, 0.2, 0.1, 0.1, 0.6, 0.2, 0.2, 0.3, 0.8, 0.9, 0.7, 0.1],
+        };
+        assert!(!looks_like_printed_page(&colored));
     }
 
     #[test]
@@ -842,6 +1038,7 @@ mod tests {
         assert_eq!(classify_kind(Path::new("a.mobi")), FileKind::Book);
         assert_eq!(classify_kind(Path::new("a.azw3")), FileKind::Book);
         assert_eq!(classify_kind(Path::new("a.asw3")), FileKind::Book);
+        assert_eq!(classify_kind(Path::new("novel.txt")), FileKind::Book);
         assert_eq!(classify_kind(Path::new("a.doc")), FileKind::Document);
         assert_eq!(classify_kind(Path::new("a.xls")), FileKind::Document);
         assert_eq!(classify_kind(Path::new("a.wps")), FileKind::Document);
@@ -858,6 +1055,49 @@ mod tests {
     }
 
     #[test]
+    fn old_audio_index_entries_default_new_metadata_fields() {
+        let json = r#"{"rel_path":"song.flac","kind":"audio","album":"","person":null,"manual":false,"book_meta":null,"image_classification_version":0,"book_metadata_attempted":false}"#;
+        let entry: LibraryEntry = serde_json::from_str(json).expect("legacy entry");
+        assert!(entry.audio_meta.is_none());
+        assert!(!entry.audio_metadata_attempted);
+    }
+
+    #[test]
+    fn audio_metadata_task_is_lazy_and_retries_failed_entries() {
+        let root = temp_root("audio-meta");
+        std::fs::write(root.join("track.flac"), b"invalid audio").expect("write audio");
+        let mut index = LibraryIndex::default();
+        index.entries.push(LibraryEntry {
+            rel_path: PathBuf::from("track.flac"),
+            kind: FileKind::Audio,
+            album: String::new(),
+            person: None,
+            manual: true,
+            book_meta: None,
+            audio_meta: None,
+            image_classification_version: 0,
+            book_metadata_attempted: false,
+            audio_metadata_attempted: false,
+        });
+        index.save(&root).expect("save index");
+        let cancel = AtomicBool::new(false);
+
+        let first = extract_audio_metadata(&root, false, |_| (), &cancel).expect("first scan");
+        assert_eq!(first.metadata_attempted, 1);
+        let index = LibraryIndex::load(&root).expect("load index");
+        let entry = index.find(Path::new("track.flac")).expect("audio entry");
+        assert!(entry.audio_meta.is_none());
+        assert!(entry.audio_metadata_attempted);
+        drop(index);
+
+        let skipped = extract_audio_metadata(&root, false, |_| (), &cancel).expect("skip failed");
+        assert_eq!(skipped.metadata_attempted, 0);
+        let retried = extract_audio_metadata(&root, true, |_| (), &cancel).expect("retry failed");
+        assert_eq!(retried.metadata_attempted, 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn scan_collapses_project_and_game_dirs() {
         let root = temp_root("entity");
         std::fs::create_dir_all(root.join("proj/src")).expect("mkdir");
@@ -868,7 +1108,8 @@ mod tests {
         std::fs::write(root.join("top.jpg"), b"x").expect("write");
 
         let cancel = AtomicBool::new(true);
-        scan(&root, &Config::default(), |_| (), &cancel).expect("cancelled scan");
+        let report = scan(&root, &Config::default(), |_| (), &cancel).expect("cancelled scan");
+        assert!(report.cancelled);
         let index = LibraryIndex::load(&root).expect("load after cancellation");
         assert_eq!(index.version, 0);
         assert!(index.entries.is_empty());
@@ -906,8 +1147,10 @@ mod tests {
                 person: None,
                 manual: false,
                 book_meta: None,
+                audio_meta: None,
                 image_classification_version: 0,
                 book_metadata_attempted: false,
+                audio_metadata_attempted: false,
             }],
         };
         index.save(&root).expect("save");
@@ -918,12 +1161,12 @@ mod tests {
             index.find(Path::new("a.epub")).expect("entry").kind,
             FileKind::Book
         );
-        assert_eq!(index.version, 8);
+        assert_eq!(index.version, 9);
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn migration_v8_reclassifies_book_and_document_formats() {
+    fn migration_v9_reclassifies_book_and_document_formats() {
         let root = temp_root("migrate8-formats");
         std::fs::write(
             root.join("book.pdf"),
@@ -953,8 +1196,10 @@ mod tests {
                     person: None,
                     manual: false,
                     book_meta: None,
+                    audio_meta: None,
                     image_classification_version: 0,
                     book_metadata_attempted: false,
+                    audio_metadata_attempted: false,
                 })
                 .collect(),
         };
@@ -979,7 +1224,7 @@ mod tests {
             index.find(Path::new("notes.markdown")).expect("markdown entry").kind,
             FileKind::Document
         );
-        assert_eq!(index.version, 8);
+        assert_eq!(index.version, 9);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1002,8 +1247,10 @@ mod tests {
                 person: None,
                 manual: false,
                 book_meta: None,
+                audio_meta: None,
                 image_classification_version: 0,
                 book_metadata_attempted: false,
+                audio_metadata_attempted: false,
             }],
         };
         index.save(&root).expect("save");
@@ -1052,8 +1299,10 @@ mod tests {
                 person: None,
                 manual: false,
                 book_meta: None,
+                audio_meta: None,
                 image_classification_version: 0,
                 book_metadata_attempted: false,
+                audio_metadata_attempted: false,
             }],
         };
         index.save(&root).expect("save");
@@ -1064,7 +1313,7 @@ mod tests {
         assert_eq!(entry.kind, FileKind::Book);
         assert!(entry.book_meta.is_none());
         assert!(!entry.book_metadata_attempted);
-        assert_eq!(index.version, 8);
+        assert_eq!(index.version, 9);
         drop(index);
 
         extract_book_metadata(&root, false, |_| (), &cancel).expect("extract book meta");
@@ -1248,8 +1497,10 @@ mod tests {
             person: Some("person_1".to_string()),
             manual: false,
             book_meta: None,
+            audio_meta: None,
             image_classification_version: 0,
             book_metadata_attempted: false,
+            audio_metadata_attempted: false,
         });
         index.entries.push(LibraryEntry {
             rel_path: PathBuf::from("s.jpg"),
@@ -1258,8 +1509,10 @@ mod tests {
             person: None,
             manual: false,
             book_meta: None,
+            audio_meta: None,
             image_classification_version: 0,
             book_metadata_attempted: false,
+            audio_metadata_attempted: false,
         });
         index.entries.push(LibraryEntry {
             rel_path: PathBuf::from("v.mp4"),
@@ -1268,8 +1521,10 @@ mod tests {
             person: None,
             manual: false,
             book_meta: None,
+            audio_meta: None,
             image_classification_version: 0,
             book_metadata_attempted: false,
+            audio_metadata_attempted: false,
         });
         let albums = index.albums();
         assert_eq!(albums.get(ALBUM_PORTRAIT), Some(&1));

@@ -6,7 +6,12 @@ edition = "2021"
 [dependencies]
 sepiola = { path = ".." }
 eframe = "0.37"
+egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
 rfd = "0.15"
 image = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+lofty = "0.22.4"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rayon = "1"

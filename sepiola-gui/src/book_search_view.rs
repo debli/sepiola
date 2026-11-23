@@ -40,7 +40,7 @@ impl SepiolaApp {
             if searching {
                 ui.spinner();
                 ui.label(format!("正文 {}/{}", progress.0, progress.1));
-                if pointing_hand(ui.small_button("取消")).clicked() {
+                if pointing_hand(ui.button("取消")).clicked() {
                     reset_content_search = true;
                 }
             }

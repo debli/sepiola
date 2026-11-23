@@ -7,6 +7,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, UTF_8, WINDOWS_1252};
 use quick_xml::events::Event as XmlEvent;
@@ -72,18 +73,41 @@ impl BookMeta {
 
 /// 按扩展名分派内容级抽取；不支持的类型或全部字段缺失时返回 `None`。
 pub fn extract(path: &Path) -> Option<BookMeta> {
+    extract_inner(path, None)
+}
+
+/// 可取消版本：解析过程中轮询 `cancel`，取消后尽快返回 `None`。
+pub fn extract_cancellable(path: &Path, cancel: &AtomicBool) -> Option<BookMeta> {
+    extract_inner(path, Some(cancel))
+}
+
+fn extract_inner(path: &Path, cancel: Option<&AtomicBool>) -> Option<BookMeta> {
+    if is_cancelled(cancel) {
+        return None;
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())?;
     let meta = match ext.as_str() {
-        "epub" => epub_meta(path)?,
-        "fb2" => fb2_meta(path)?,
-        "mobi" | "azw" | "azw3" | "asw3" => mobi_meta(path)?,
-        "pdf" => pdf_meta(path)?,
+        "epub" => epub_meta(path, cancel)?,
+        "fb2" => fb2_meta(path, cancel)?,
+        "mobi" | "azw" | "azw3" | "asw3" => mobi_meta(path, cancel)?,
+        "pdf" => pdf_meta(path, cancel)?,
+        // TXT 无内嵌元数据，用文件名作书名，避免书籍页把它统计为提取失败。
+        "txt" => BookMeta {
+            title: path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned()),
+            ..BookMeta::default()
+        },
         _ => return None,
     };
     (!meta.is_empty()).then_some(meta)
+}
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 /// 判断电子书正文是否包含关键词；格式解析在调用方后台线程运行。
@@ -100,34 +124,62 @@ pub fn contains_text(path: &Path, needle: &str) -> bool {
         return false;
     };
     let text = match ext.as_str() {
-        "epub" => epub_content_text(path),
-        "pdf" => pdf_content_text(path),
-        "fb2" => fb2_content_text(path),
-        "mobi" | "azw" | "azw3" | "asw3" => mobi_content_text(path),
+        "epub" => epub_content_text(path, None),
+        "pdf" => pdf_content_text(path, None),
+        "fb2" => fb2_content_text(path, None),
+        "mobi" | "azw" | "azw3" | "asw3" => mobi_content_text(path, None),
         _ => None,
     };
     text.is_some_and(|text| text.to_lowercase().contains(&needle))
 }
 
-fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+fn read_bounded(path: &Path, cancel: Option<&AtomicBool>) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() > MAX_CONTENT_BYTES as u64 {
         return None;
     }
+    read_stream(file, Some(MAX_CONTENT_BYTES), cancel)
+}
+
+/// 分块读取（不设上限），每块前检查取消标志，避免大文件读盘期间长时间无法取消。
+fn read_all_cancellable(path: &Path, cancel: Option<&AtomicBool>) -> Option<Vec<u8>> {
+    read_stream(std::fs::File::open(path).ok()?, None, cancel)
+}
+
+fn read_stream<R: Read>(
+    mut reader: R,
+    limit: Option<usize>,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
-    file.take(MAX_CONTENT_BYTES as u64)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    let mut chunk = [0u8; 256 * 1024];
+    loop {
+        if is_cancelled(cancel) {
+            return None;
+        }
+        if limit.is_some_and(|limit| bytes.len() >= limit) {
+            break;
+        }
+        let cap = limit.map_or(chunk.len(), |limit| (limit - bytes.len()).min(chunk.len()));
+        if cap == 0 {
+            break;
+        }
+        let read = reader.read(&mut chunk[..cap]).ok()?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
     Some(bytes)
 }
 
-fn epub_content_text(path: &Path) -> Option<String> {
+fn epub_content_text(path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let mut zip = zip::ZipArchive::new(file).ok()?;
     let mut text = String::new();
     let mut remaining = MAX_CONTENT_BYTES;
     for index in 0..zip.len() {
-        if remaining == 0 {
+        if remaining == 0 || is_cancelled(cancel) {
             break;
         }
         let entry = zip.by_index(index).ok()?;
@@ -146,20 +198,24 @@ fn epub_content_text(path: &Path) -> Option<String> {
     Some(text)
 }
 
-fn pdf_content_text(path: &Path) -> Option<String> {
-    let bytes = read_bounded(path)?;
-    std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
-        .ok()?
-        .ok()
+fn pdf_content_text(path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {
+    if is_cancelled(cancel) {
+        return None;
+    }
+    let text = crate::pdf_text::extract_cached(path, MAX_CONTENT_BYTES as u64).ok()?;
+    (!is_cancelled(cancel)).then_some(text)
 }
 
-fn fb2_content_text(path: &Path) -> Option<String> {
-    let bytes = read_bounded(path)?;
+fn fb2_content_text(path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {
+    let bytes = read_bounded(path, cancel)?;
     let raw = String::from_utf8_lossy(&bytes);
     let mut reader = quick_xml::Reader::from_str(&raw);
     reader.config_mut().trim_text(true);
     let mut text = String::new();
     loop {
+        if is_cancelled(cancel) {
+            return None;
+        }
         match reader.read_event() {
             Ok(XmlEvent::Text(event)) => text.push_str(&event.unescape().ok()?),
             Ok(XmlEvent::CData(event)) => text.push_str(&String::from_utf8_lossy(&event)),
@@ -196,7 +252,10 @@ fn strip_markup(raw: &str) -> String {
         .join(" ")
 }
 
-fn mobi_content_text(path: &Path) -> Option<String> {
+fn mobi_content_text(path: &Path, cancel: Option<&AtomicBool>) -> Option<String> {
+    if is_cancelled(cancel) {
+        return None;
+    }
     let mut file = std::fs::File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();
     let mut database_header = [0u8; 78];
@@ -244,7 +303,7 @@ fn mobi_content_text(path: &Path) -> Option<String> {
     let codepage = u32_be(&record0, mobi_offset + 12)?;
     let mut content = Vec::with_capacity(text_length.min(MAX_CONTENT_BYTES));
     for index in 1..=text_records {
-        if content.len() >= MAX_CONTENT_BYTES {
+        if content.len() >= MAX_CONTENT_BYTES || is_cancelled(cancel) {
             break;
         }
         let record = read_record(&mut file, index)?;
@@ -308,23 +367,33 @@ fn decompress_palmdoc(input: &[u8], limit: usize) -> Option<Vec<u8>> {
 
 // ---------------------------------------------------------------- EPUB
 
-fn epub_meta(path: &Path) -> Option<BookMeta> {
+fn epub_meta(path: &Path, cancel: Option<&AtomicBool>) -> Option<BookMeta> {
     let file = std::fs::File::open(path).ok()?;
     let mut zip = zip::ZipArchive::new(file).ok()?;
-    let container = read_zip_text(&mut zip, "META-INF/container.xml")?;
+    let container = read_zip_text(&mut zip, "META-INF/container.xml", cancel)?;
     let opf_path = find_attr(&container, "full-path")?;
-    let opf = read_zip_text(&mut zip, &opf_path)?;
+    let opf = read_zip_text(&mut zip, &opf_path, cancel)?;
     let mut meta = parse_opf(&opf);
     // 版权页/扉页文本启发式补齐 OPF 缺失字段（译者、版本、ISBN、年份等）。
-    let text = epub_body_text(&mut zip);
+    let text = epub_body_text(&mut zip, cancel);
     fill_from_text(&mut meta, &text);
     Some(meta)
 }
 
-fn read_zip_text<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
+fn read_zip_text<R: Read + Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    name: &str,
+    cancel: Option<&AtomicBool>,
+) -> Option<String> {
+    if is_cancelled(cancel) {
+        return None;
+    }
     let mut entry = zip.by_name(name).ok()?;
     let mut buf = Vec::new();
     entry.read_to_end(&mut buf).ok()?;
+    if is_cancelled(cancel) {
+        return None;
+    }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -388,11 +457,11 @@ fn parse_opf(opf: &str) -> BookMeta {
 }
 
 /// 收集前若干部 XHTML/HTML 的纯文本（限 200KB），供版权页启发式使用。
-fn epub_body_text<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> String {
+fn epub_body_text<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, cancel: Option<&AtomicBool>) -> String {
     let mut out = String::new();
     let mut budget = 200_000usize;
     for i in 0..zip.len() {
-        if budget == 0 {
+        if budget == 0 || is_cancelled(cancel) {
             break;
         }
         let Ok(mut entry) = zip.by_index(i) else { continue };
@@ -421,8 +490,8 @@ fn epub_body_text<R: Read + Seek>(zip: &mut zip::ZipArchive<R>) -> String {
 
 // ---------------------------------------------------------------- FB2
 
-fn fb2_meta(path: &Path) -> Option<BookMeta> {
-    let raw = std::fs::read(path).ok()?;
+fn fb2_meta(path: &Path, cancel: Option<&AtomicBool>) -> Option<BookMeta> {
+    let raw = read_all_cancellable(path, cancel)?;
     let text = String::from_utf8_lossy(&raw);
     let mut meta = BookMeta::default();
     let mut reader = quick_xml::Reader::from_str(&text);
@@ -431,6 +500,9 @@ fn fb2_meta(path: &Path) -> Option<BookMeta> {
     let mut author_parts: Vec<String> = Vec::new();
     let mut translator_parts: Vec<String> = Vec::new();
     loop {
+        if is_cancelled(cancel) {
+            return None;
+        }
         match reader.read_event() {
             Ok(XmlEvent::Start(e)) => {
                 stack.push(e.name().local_name().as_ref().to_vec());
@@ -491,7 +563,10 @@ fn join_parts(parts: &mut Vec<String>, slot: &mut Option<String>) {
 
 // ---------------------------------------------------------------- MOBI / AZW / AZW3
 
-fn mobi_meta(path: &Path) -> Option<BookMeta> {
+fn mobi_meta(path: &Path, cancel: Option<&AtomicBool>) -> Option<BookMeta> {
+    if is_cancelled(cancel) {
+        return None;
+    }
     let mut file = std::fs::File::open(path).ok()?;
     let head = read_prefix(&mut file, 128 * 1024)?;
     // 书名兜底：PalmDB 头 name 字段（0..32，NUL 结尾）。
@@ -522,6 +597,9 @@ fn mobi_meta(path: &Path) -> Option<BookMeta> {
     let mut meta = BookMeta::default();
     let mut pos = 12;
     for _ in 0..count {
+        if is_cancelled(cancel) {
+            return None;
+        }
         if pos + 8 > exth_bytes.len() {
             break;
         }
@@ -587,11 +665,14 @@ fn trim_nul(bytes: &[u8]) -> String {
 
 // ---------------------------------------------------------------- PDF
 
-fn pdf_meta(path: &Path) -> Option<BookMeta> {
-    let bytes = std::fs::read(path).ok()?;
-    let text = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes))
-        .ok()?
-        .ok()?;
+fn pdf_meta(path: &Path, cancel: Option<&AtomicBool>) -> Option<BookMeta> {
+    if is_cancelled(cancel) {
+        return None;
+    }
+    let text = crate::pdf_text::extract_cached(path, u64::MAX).ok()?;
+    if is_cancelled(cancel) {
+        return None;
+    }
     if text.trim().is_empty() {
         return None; // 扫描版无文本层
     }

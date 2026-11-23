@@ -14,6 +14,8 @@ pub enum Error {
     Config(String),
     #[error("model: {0}")]
     Model(String),
+    #[error("thread pool: {0}")]
+    ThreadPool(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

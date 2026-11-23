@@ -1,0 +1,1761 @@
+//! 阅读正文：跨章连续滚动、滑动窗口与选区捕获（M45）。
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use eframe::egui;
+use sepiola::reader::analysis_store::{self, BookAnalysis};
+use sepiola::reader::analyze::{Annotation, AnnotationKind};
+use sepiola::reader::highlight::Highlight;
+use sepiola::reader::{
+    BookDocument, Chapter, ChapterImage, LinkSpan, LinkTarget, ReaderFont, StyleSpan,
+};
+
+use crate::reader::Selection;
+use crate::state::SepiolaApp;
+
+/// 距离底部小于该值时追加下一章。
+const APPEND_THRESHOLD: f32 = 320.0;
+/// 滚动到窗口顶部（偏移小于该值）时回补上一章，每次只补一章。
+const PREPEND_EDGE: f32 = 24.0;
+/// 顶部章节完全离开可视区超过该高度（屏数）时丢弃。
+const DROP_BUFFER: f32 = 1.0;
+/// 可视区下方保留的缓冲（屏数）；更远的章节会被裁掉。
+const BOTTOM_BUFFER: f32 = 1.0;
+/// 从未测量过的章高兜底值。
+const DEFAULT_CHAPTER_HEIGHT: f32 = 800.0;
+/// 标题字号相对正文的增量（h1..h6）。
+const HEADING_SCALE: [f32; 6] = [10.0, 8.0, 6.0, 4.0, 3.0, 2.0];
+/// 注册到字体表里的粗体/斜体字族名（见 `assets::install_cjk_font`）。
+const BOLD_FAMILY: &str = "reader-bold";
+const SERIF_BOLD_FAMILY: &str = "reader-serif-bold";
+const ITALIC_FAMILY: &str = "reader-italic";
+
+/// 阅读字体对应的字体族；系统缺少相应字体或用户选择了自定义字体时回退/切换。
+pub fn reader_font_family(ui: &egui::Ui, font: ReaderFont, custom: bool) -> egui::FontFamily {
+    let named = |name: &str| egui::FontFamily::Name(name.into());
+    let available = |name: &str| {
+        ui.fonts_mut(|fonts| fonts.families())
+            .contains(&egui::FontFamily::Name(name.into()))
+    };
+    if custom && available("reader-custom") {
+        return named("reader-custom");
+    }
+    match font {
+        ReaderFont::Sans => egui::FontFamily::Proportional,
+        ReaderFont::Mono => egui::FontFamily::Monospace,
+        ReaderFont::Serif if available("reader-serif") => named("reader-serif"),
+        ReaderFont::Kai if available("reader-kai") => named("reader-kai"),
+        ReaderFont::Serif | ReaderFont::Kai if available("reader-serif") => named("reader-serif"),
+        ReaderFont::Serif | ReaderFont::Kai => egui::FontFamily::Proportional,
+    }
+}
+
+/// 分析条目的强调色（正文彩标与图例共用）。
+pub fn annotation_color(kind: AnnotationKind) -> egui::Color32 {
+    match kind {
+        AnnotationKind::Phrase => egui::Color32::from_rgb(64, 126, 214),
+        AnnotationKind::Expression => egui::Color32::from_rgb(52, 150, 96),
+        AnnotationKind::Grammar => egui::Color32::from_rgb(214, 138, 46),
+        AnnotationKind::Pattern => egui::Color32::from_rgb(136, 92, 200),
+        AnnotationKind::Term => egui::Color32::from_rgb(28, 142, 156),
+        AnnotationKind::ProperNoun => egui::Color32::from_rgb(198, 78, 118),
+    }
+}
+
+fn annotation_fill(kind: AnnotationKind) -> egui::Color32 {
+    let [r, g, b, _] = annotation_color(kind).to_array();
+    egui::Color32::from_rgba_unmultiplied(r, g, b, 40)
+}
+
+/// 按样式区间、链接与 AI 彩标把正文排成 `LayoutJob`；预排版与渲染共用，保证高度一致。
+/// `base..base + len` 指定本章正文里本次要排版的字节范围（插图会把正文切成多段）。
+fn styled_job(
+    ui: &egui::Ui,
+    text: &str,
+    base: usize,
+    len: usize,
+    spans: &[StyleSpan],
+    links: &[LinkSpan],
+    annotations: &[Annotation],
+    highlights: &[Highlight],
+    font_size: f32,
+    family: &egui::FontFamily,
+    line_spacing: f32,
+    width: f32,
+) -> egui::text::LayoutJob {
+    let color = ui.visuals().text_color();
+    let link_color = ui.visuals().hyperlink_color;
+    let spacing = line_spacing.max(0.5);
+    let base_font = egui::FontId::new(font_size, family.clone());
+    let base_line =
+        ui.fonts_mut(|fonts| fonts.row_height(&base_font)) + ui.spacing().extra_text_line_spacing;
+    let families = ui.fonts_mut(|fonts| fonts.families());
+    // 宋体/楷体的粗体用衬线粗体，避免正文里出现混排的无衬线粗体。
+    let bold_name = match family {
+        egui::FontFamily::Name(name)
+            if name.as_ref() == "reader-serif" || name.as_ref() == "reader-kai" =>
+        {
+            SERIF_BOLD_FAMILY
+        }
+        _ => BOLD_FAMILY,
+    };
+    let bold_family = egui::FontFamily::Name(bold_name.into());
+    let italic_family = egui::FontFamily::Name(ITALIC_FAMILY.into());
+    let has_bold = families.contains(&bold_family);
+    let has_italic = families.contains(&italic_family);
+
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = width;
+    job.keep_trailing_whitespace = true;
+
+    // 样式区间与链接各自可能部分覆盖文本，先切出所有边界再逐段排版。
+    let begin = base.min(text.len());
+    let finish = (base + len).min(text.len()).max(begin);
+    let mut cuts: Vec<usize> = vec![begin, finish];
+    for span in spans {
+        cuts.push(span.start.clamp(begin, finish));
+        cuts.push(span.end.clamp(begin, finish));
+    }
+    for link in links {
+        cuts.push(link.start.clamp(begin, finish));
+        cuts.push(link.end.clamp(begin, finish));
+    }
+    for annotation in annotations {
+        cuts.push(annotation.start.clamp(begin, finish));
+        cuts.push(annotation.end.clamp(begin, finish));
+    }
+    for highlight in highlights {
+        cuts.push(highlight.start.clamp(begin, finish));
+        cuts.push(highlight.end.clamp(begin, finish));
+    }
+    cuts.retain(|cut| text.is_char_boundary(*cut));
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end {
+            continue;
+        }
+        let style = spans
+            .iter()
+            .find(|span| span.start <= start && end <= span.end)
+            .map(|span| span.style)
+            .unwrap_or_default();
+        let is_link = links
+            .iter()
+            .any(|link| link.start <= start && end <= link.end);
+        let annotation = annotations
+            .iter()
+            .find(|annotation| annotation.start <= start && end <= annotation.end);
+        let highlight = highlights
+            .iter()
+            .find(|highlight| highlight.start <= start && end <= highlight.end);
+        let bonus = style
+            .heading
+            .checked_sub(1)
+            .and_then(|index| HEADING_SCALE.get(index as usize))
+            .copied()
+            .unwrap_or(0.0);
+        let font_family = if style.mono {
+            egui::FontFamily::Monospace
+        } else if style.bold && has_bold {
+            bold_family.clone()
+        } else if style.italic && has_italic {
+            italic_family.clone()
+        } else {
+            family.clone()
+        };
+        let format = egui::text::TextFormat {
+            font_id: egui::FontId::new(font_size + bonus, font_family),
+            color: if is_link { link_color } else { color },
+            background: highlight
+                .map(|highlight| {
+                    let [r, g, b] = highlight.color;
+                    egui::Color32::from_rgba_unmultiplied(r, g, b, 110)
+                })
+                .or_else(|| {
+                    annotation.map(|annotation| annotation_fill(annotation.kind))
+                })
+                .unwrap_or(egui::Color32::TRANSPARENT),
+            line_height: Some((base_line + bonus) * spacing),
+            // 没有斜体字面时用倾斜合成。
+            italics: style.italic && !has_italic,
+            underline: if is_link {
+                egui::Stroke::new(1.0, link_color)
+            } else if let Some(annotation) = annotation {
+                egui::Stroke::new(1.0, annotation_color(annotation.kind))
+            } else {
+                egui::Stroke::NONE
+            },
+            ..Default::default()
+        };
+        job.append(&text[start..end], 0.0, format);
+    }
+    job
+}
+
+/// 点击位置（字符序号）落在哪个链接区间上。
+fn link_at_char(chapter: &Chapter, char_index: usize) -> Option<&LinkTarget> {
+    let byte = chapter
+        .text
+        .char_indices()
+        .nth(char_index)
+        .map(|(offset, _)| offset)
+        .unwrap_or(chapter.text.len());
+    chapter
+        .links
+        .iter()
+        .find(|link| link.start <= byte && byte < link.end)
+        .map(|link| &link.target)
+}
+
+/// 字符序号 → 字节偏移（越界时取文本末尾）。
+fn char_offset(text: &str, char_index: usize) -> usize {
+    text.char_indices()
+        .nth(char_index)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len())
+}
+
+/// 字节位置是否落在某个 AI 彩标区间内。
+fn annotation_at_byte<'a>(
+    annotations: &'a [Annotation],
+    chapter: usize,
+    byte: usize,
+) -> Option<&'a Annotation> {
+    annotations
+        .iter()
+        .find(|annotation| annotation.chapter == chapter && annotation.start <= byte && byte < annotation.end)
+}
+
+/// 某章已缓存的彩标；正文指纹不一致（已改动）时视为没有缓存。
+fn cached_annotations(
+    book: &BookAnalysis,
+    chapter: &Chapter,
+    index: usize,
+    enabled: bool,
+) -> Vec<Annotation> {
+    if !enabled {
+        return Vec::new();
+    }
+    book.entry(index, analysis_store::fingerprint(&chapter.text))
+        .map(|entry| entry.annotations.clone())
+        .unwrap_or_default()
+}
+
+/// 按正文实际使用的字体与换行宽度预排版，得到章节块高度（标题 + 间距 + 正文）。
+/// 复刻 `TextEdit` 的默认排版参数，用于回补章节时在同一帧内校正滚动偏移。
+fn measure_chapter_height(
+    ui: &egui::Ui,
+    chapter: &Chapter,
+    annotations: &[Annotation],
+    font_size: f32,
+    family: egui::FontFamily,
+    line_spacing: f32,
+    paragraph_spacing: f32,
+    width: f32,
+) -> f32 {
+    let text_color = ui.visuals().text_color();
+    let spacing = line_spacing.max(0.5);
+    let font_id = egui::FontId::new(font_size, family.clone());
+    let line_height = (ui.fonts_mut(|f| f.row_height(&font_id))
+        + ui.spacing().extra_text_line_spacing)
+        * spacing;
+    let item_spacing = ui.spacing().item_spacing.y;
+    // `TextEdit` 分配的高度不低于 `interact_size.y`（单行短文本会被抬高到该高度）。
+    let interact_height = ui.spacing().interact_size.y;
+    // 正文按插图切成若干段，逐段排版后累加高度（每段都至少保留一行）。
+    let mut body_height = 0.0f32;
+    // 上一段正文最后一行的 (右边缘, 行顶偏移, 控件高度)，用于判断行内插图能否挤在同一行。
+    let mut last_line: Option<(f32, f32, f32)> = None;
+    // 行内图右侧已续排的文字字节数，轮到下一段正文时跳过。
+    let mut skip = 0usize;
+    let items = chapter_items(chapter);
+    for i in 0..items.len() {
+        match &items[i] {
+            ChapterItem::Text(range) => {
+                let start = (range.start + skip).min(range.end);
+                skip = 0;
+                if start >= range.end {
+                    continue;
+                }
+                let job = styled_job(
+                    ui,
+                    &chapter.text,
+                    start,
+                    range.end - start,
+                    &chapter.spans,
+                    &chapter.links,
+                    annotations,
+                    &[],
+                    font_size,
+                    &family,
+                    line_spacing,
+                    width,
+                );
+                // 段间距通过下移 galley 行实现，保持单一 TextEdit，可跨段落选择。
+                let galley = with_paragraph_spacing(
+                    ui.fonts_mut(|f| f.layout_job(job)),
+                    paragraph_spacing,
+                );
+                let text_height = galley.size().y.max(line_height).max(interact_height);
+                body_height += text_height + item_spacing;
+                last_line = galley.rows.last().map(|row| {
+                    (
+                        row.pos.x + row.row.size.x,
+                        row.pos.y,
+                        text_height,
+                    )
+                });
+            }
+            ChapterItem::Image(index) => {
+                let index = *index;
+                let image = &chapter.images[index];
+                if image.width.is_none() || image.height.is_none() {
+                    // 尺寸未知（如 SVG）时渲染成一行占位文字。
+                    body_height += line_height + item_spacing;
+                    last_line = None;
+                    continue;
+                }
+                let size = image_display_size(image, width, line_height, ui.ctx());
+                // 行内图挤在上一行末尾时不占新行，只需补足超出该行的部分。
+                if let Some((right, row_top, text_height)) = last_line {
+                    if image.inline && right + INLINE_GAP + size.x <= width {
+                        let mut band_bottom = row_top + size.y;
+                        let mut piece_right = None;
+                        // 图片右边的空白继续排后续正文，让文字绕在插图两侧。
+                        if let Some(ChapterItem::Text(next)) = items.get(i + 1) {
+                            let piece_x = right + INLINE_GAP + size.x;
+                            let piece_width = width - piece_x;
+                            if let Some((_, skip_bytes, piece_height, piece_row_width)) =
+                                inline_follow(
+                                    ui,
+                                    chapter,
+                                    annotations,
+                                    next.start,
+                                    next.len(),
+                                    piece_width,
+                                    font_size,
+                                    &family,
+                                    line_spacing,
+                                    interact_height,
+                                )
+                            {
+                                skip = skip_bytes;
+                                band_bottom = band_bottom.max(row_top + piece_height);
+                                piece_right = Some(piece_x + piece_row_width);
+                            }
+                        }
+                        let accounted = text_height.max(band_bottom);
+                        body_height += accounted - text_height;
+                        // 续排片段这一行还能继续贴下一幅行内图。
+                        last_line = piece_right.map(|x| (x, row_top, accounted));
+                        continue;
+                    }
+                }
+                body_height += size.y + IMAGE_PADDING * 2.0 + item_spacing;
+                last_line = None;
+            }
+        }
+    }
+
+    let title_job = egui::text::LayoutJob::simple(
+        chapter.title.clone(),
+        egui::FontId::new(font_size + 2.0, family),
+        text_color,
+        width,
+    );
+    let title_height = ui.fonts_mut(|f| f.layout_job(title_job)).size().y;
+
+    // 块高 = 标题 + item spacing + 4.0 + 正文（每段已计入自身的 item spacing）。
+    title_height + 4.0 + body_height + item_spacing
+}
+
+/// 章节渲染项：一段正文，或一幅插图（`Chapter::images` 的下标）。
+enum ChapterItem {
+    Text(std::ops::Range<usize>),
+    Image(usize),
+}
+
+/// 插图上下留白。
+const IMAGE_PADDING: f32 = 6.0;
+/// 行内插图与前面文字的间距。
+const INLINE_GAP: f32 = 4.0;
+
+/// 在已排版的 galley 上为每个新段落的首行加入段间距。
+/// 只下移行的纵向位置、不改动文本内容，因此仍是单个 TextEdit，可跨段落选择。
+fn with_paragraph_spacing(
+    galley: std::sync::Arc<egui::Galley>,
+    paragraph_spacing: f32,
+) -> std::sync::Arc<egui::Galley> {
+    if paragraph_spacing <= 0.0 || galley.rows.len() < 2 {
+        return galley;
+    }
+    let mut galley = std::sync::Arc::unwrap_or_clone(galley);
+    let mut shift = 0.0f32;
+    let mut starts_paragraph = false;
+    for row in &mut galley.rows {
+        if starts_paragraph {
+            shift += paragraph_spacing;
+        }
+        row.pos.y += shift;
+        // 当前行以换行结束时，下一行就是新段落的首行。
+        starts_paragraph = row.ends_with_newline;
+    }
+    galley.rect.max.y += shift;
+    galley.mesh_bounds.max.y += shift;
+    std::sync::Arc::new(galley)
+}
+
+/// 把章节正文按插图位置切成「正文段 / 插图」的交替序列。
+/// 块级图片插到所在行的末尾，避免把一行文字从中间截断；行内图片保留原位置，
+/// 渲染时会贴在上一行文字末尾。
+fn chapter_items(chapter: &Chapter) -> Vec<ChapterItem> {
+    let mut items = Vec::new();
+    let mut cursor = 0usize;
+    for (index, image) in chapter.images.iter().enumerate() {
+        let mut at = image.at.min(chapter.text.len());
+        while at < chapter.text.len() && !chapter.text.is_char_boundary(at) {
+            at += 1;
+        }
+        if !image.inline {
+            at = match chapter.text[at..].find('\n') {
+                Some(offset) => at + offset + 1,
+                None => chapter.text.len(),
+            };
+        }
+        if at > cursor {
+            items.push(ChapterItem::Text(cursor..at));
+            cursor = at;
+        }
+        items.push(ChapterItem::Image(index));
+    }
+    if cursor < chapter.text.len() {
+        items.push(ChapterItem::Text(cursor..chapter.text.len()));
+    }
+    items
+}
+
+/// 插图在正文宽度内的显示尺寸：优先使用书里声明的宽高，再按可用宽度与高度上限缩放。
+fn image_display_size(
+    image: &ChapterImage,
+    available_width: f32,
+    line_height: f32,
+    ctx: &egui::Context,
+) -> egui::Vec2 {
+    let max_width = available_width.max(1.0);
+    let (Some(width), Some(height)) = (image.width, image.height) else {
+        return egui::Vec2::new(max_width.min(480.0), 120.0);
+    };
+    if width == 0 || height == 0 {
+        return egui::Vec2::new(max_width.min(480.0), 120.0);
+    }
+    let aspect = width as f32 / height as f32;
+    // 声明尺寸优先；只声明了一边时按原始比例补出另一边。
+    let mut draw_width = image.declared_width.unwrap_or(width as f32);
+    let mut draw_height = image.declared_height.unwrap_or(draw_width / aspect);
+    if image.declared_width.is_none() && image.declared_height.is_none() {
+        draw_width = width as f32;
+        draw_height = height as f32;
+    } else if image.declared_width.is_none() {
+        draw_width = draw_height * aspect;
+    }
+    if let Some(percent) = image.width_percent {
+        draw_width = max_width * percent;
+        draw_height = draw_width / aspect;
+    }
+    if draw_width > max_width {
+        draw_height *= max_width / draw_width;
+        draw_width = max_width;
+    }
+    // 高度上限：行内图最多一行高，保证与文字同行、不把正文挤开；整段插图不超过 70% 视口。
+    let max_height = if image.inline {
+        line_height
+    } else {
+        ctx.content_rect().height() * 0.7
+    };
+    if draw_height > max_height {
+        draw_width *= max_height / draw_height;
+        draw_height = max_height;
+    }
+    egui::Vec2::new(draw_width.max(1.0), draw_height.max(1.0))
+}
+
+/// 行内图右侧续排时，剩余宽度小于该值就不再往图片右边塞字。
+const MIN_INLINE_PIECE_WIDTH: f32 = 24.0;
+
+/// 计算行内图右侧这一行能排下的文字：返回（片段字节数, 后续正文需跳过的字节数, 片段高度, 片段首行宽度）。
+/// 片段即从 `start` 开始、能在 `piece_width` 内排成一行的字符；剩余正文另起一段。
+fn inline_follow(
+    ui: &egui::Ui,
+    chapter: &Chapter,
+    annotations: &[Annotation],
+    start: usize,
+    len: usize,
+    piece_width: f32,
+    font_size: f32,
+    family: &egui::FontFamily,
+    line_spacing: f32,
+    interact_height: f32,
+) -> Option<(usize, usize, f32, f32)> {
+    if len == 0 || piece_width < MIN_INLINE_PIECE_WIDTH {
+        return None;
+    }
+    let job = styled_job(
+        ui,
+        &chapter.text,
+        start,
+        len,
+        &chapter.spans,
+        &chapter.links,
+        annotations,
+        &[],
+        font_size,
+        family,
+        line_spacing,
+        piece_width,
+    );
+    let galley = ui.fonts_mut(|f| f.layout_job(job));
+    let row = galley.rows.first()?;
+    let chars: Vec<(usize, char)> = chapter.text[start..start + len].char_indices().collect();
+    // 首行的字符数；行尾空白不带到片段里，避免末尾多出空隙。
+    let mut taken = row.glyphs.len().min(chars.len());
+    while taken > 0 && chars[taken - 1].1.is_whitespace() {
+        taken -= 1;
+    }
+    if taken == 0 {
+        return None;
+    }
+    let piece_bytes = chars[taken - 1].0 + chars[taken - 1].1.len_utf8();
+    // 剩余正文从下一个非空白字符开始（空行/空格由分段自身承担）。
+    let mut next = taken;
+    while next < chars.len() && chars[next].1.is_whitespace() {
+        next += 1;
+    }
+    let skip_bytes = chars.get(next).map(|(offset, _)| *offset).unwrap_or(len);
+    Some((
+        piece_bytes,
+        skip_bytes,
+        row.size.y.max(interact_height),
+        row.size.x,
+    ))
+}
+
+/// 图片纹理缓存：首次渲染时解码，失败也记下来，避免每帧重复尝试。
+fn image_texture(
+    textures: &mut HashMap<(usize, usize), Option<egui::TextureHandle>>,
+    ctx: &egui::Context,
+    chapter: usize,
+    index: usize,
+    data: &std::sync::Arc<Vec<u8>>,
+) -> Option<egui::TextureHandle> {
+    if let Some(cached) = textures.get(&(chapter, index)) {
+        return cached.clone();
+    }
+    let texture = decode_texture(ctx, chapter, index, data);
+    textures.insert((chapter, index), texture.clone());
+    texture
+}
+
+fn decode_texture(
+    ctx: &egui::Context,
+    chapter: usize,
+    index: usize,
+    data: &[u8],
+) -> Option<egui::TextureHandle> {
+    let decoded = image::load_from_memory(data).ok()?;
+    // 超大插图先等比缩小，避免纹理占用过多显存。
+    let decoded = if decoded.width() > MAX_TEXTURE_WIDTH {
+        let scale = MAX_TEXTURE_WIDTH as f32 / decoded.width() as f32;
+        let height = (decoded.height() as f32 * scale).round().max(1.0) as u32;
+        decoded.resize(MAX_TEXTURE_WIDTH, height, image::imageops::FilterType::Triangle)
+    } else {
+        decoded
+    };
+    let rgba = decoded.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+    Some(ctx.load_texture(
+        format!("reader_image_{chapter}_{index}"),
+        color,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// 单张插图解码后的最大宽度（像素）。
+const MAX_TEXTURE_WIDTH: u32 = 1600;
+
+/// 一章的渲染结果。
+struct ChapterRender {
+    /// 各正文段的控件信息（插图把正文切成了多段）。
+    segments: Vec<SegmentRender>,
+    /// 本帧是否点击了章节内的插图。
+    image_clicked: bool,
+}
+
+/// 一个正文段的渲染结果；`char_base` 是该段首字符在章节全文中的字符序号。
+struct SegmentRender {
+    id: egui::Id,
+    char_base: usize,
+    char_len: usize,
+    output: egui::text_edit::TextEditOutput,
+}
+
+/// 渲染一章的标题、正文与插图，返回各正文段的控件信息。
+fn chapter_block(
+    ui: &mut egui::Ui,
+    index: usize,
+    chapter: &Chapter,
+    annotations: &[Annotation],
+    highlights: &[Highlight],
+    font_size: f32,
+    family: egui::FontFamily,
+    line_spacing: f32,
+    paragraph_spacing: f32,
+    textures: &mut HashMap<(usize, usize), Option<egui::TextureHandle>>,
+) -> ChapterRender {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(chapter.title.as_str())
+                .size(font_size + 2.0)
+                .strong(),
+        )
+        .wrap(),
+    );
+    ui.add_space(4.0);
+    let width = ui.available_width();
+    let spans = chapter.spans.as_slice();
+    let links = chapter.links.as_slice();
+    let font_id = egui::FontId::new(font_size, family.clone());
+    let line_height = (ui.fonts_mut(|f| f.row_height(&font_id))
+        + ui.spacing().extra_text_line_spacing)
+        * line_spacing.max(0.5);
+    let mut rendered = Vec::new();
+    let mut image_clicked = false;
+    let mut char_base = 0usize;
+    // 紧邻上一项的文字段下标；插图之后清空，避免行内图贴到更早的行上。
+    let mut last_text: Option<usize> = None;
+    // 行内图右侧已续排的字节数，轮到下一段正文时跳过。
+    let mut skip = 0usize;
+    let interact_height = ui.spacing().interact_size.y;
+    let column_right = ui.cursor().left() + width;
+    let items = chapter_items(chapter);
+    for item_index in 0..items.len() {
+        match &items[item_index] {
+            ChapterItem::Text(range) => {
+                let start = (range.start + skip).min(range.end);
+                skip = 0;
+                // 被续排到图片右侧（含空白）的字符不再出现在本段，补齐字符序号。
+                char_base += chapter.text[range.start..start].chars().count();
+                if start >= range.end {
+                    continue;
+                }
+                // 段间距通过下移 galley 行实现，保持单一 TextEdit，可跨段落选择。
+                let id = ui.make_persistent_id(("reader_text", index, item_index));
+                let base = start;
+                let len = range.end - start;
+                let mut text: &str = &chapter.text[start..range.end];
+                let mut layouter =
+                    |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+                        let job = styled_job(
+                            ui,
+                            &chapter.text,
+                            base,
+                            buffer.as_str().len().min(len),
+                            spans,
+                            links,
+                            annotations,
+                            highlights,
+                            font_size,
+                            &family,
+                            line_spacing,
+                            wrap_width,
+                        );
+                        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                        with_paragraph_spacing(galley, paragraph_spacing)
+                    };
+                let output = egui::TextEdit::multiline(&mut text)
+                    .id(id)
+                    .font(font_id.clone())
+                    .frame(egui::Frame::NONE)
+                    .desired_width(width)
+                    // 默认最少 4 行；正文高度由 galley 决定，限定为 1 行。
+                    .desired_rows(1)
+                    .margin(egui::Margin::symmetric(0, 0))
+                    .layouter(&mut layouter)
+                    .show(ui);
+                let char_len = chapter.text[start..range.end].chars().count();
+                rendered.push(SegmentRender {
+                    id,
+                    char_base,
+                    char_len,
+                    output,
+                });
+                char_base += char_len;
+                last_text = Some(rendered.len() - 1);
+            }
+            ChapterItem::Image(image_index) => {
+                let image_index = *image_index;
+                let image = &chapter.images[image_index];
+                if image.width.is_none() || image.height.is_none() {
+                    // SVG 等无法直接解码的格式：留一行占位，避免正文里出现空洞。
+                    ui.weak("（图片无法显示）");
+                    last_text = None;
+                    continue;
+                }
+                let size = image_display_size(image, width, line_height, ui.ctx());
+                let Some(texture) =
+                    image_texture(textures, ui.ctx(), index, image_index, &image.data)
+                else {
+                    ui.weak("（图片无法显示）");
+                    last_text = None;
+                    continue;
+                };
+                // 行内图优先贴在上一行文字末尾，不单独占一行，减少对阅读的打断。
+                let anchor = last_text.and_then(|segment_index| {
+                    let segment = &rendered[segment_index];
+                    let row = segment.output.galley.rows.last()?;
+                    let left = segment.output.galley_pos + row.pos.to_vec2();
+                    let right = left.x + row.row.size.x;
+                    (image.inline && right + INLINE_GAP + size.x <= column_right)
+                        .then_some((right + INLINE_GAP, left.y))
+                });
+                match anchor {
+                    Some((x, y)) => {
+                        last_text = None;
+                        let rect = egui::Rect::from_min_size(egui::pos2(x, y), size);
+                        // `put` 会把游标推进到图片底部之后；图比这一行矮时会被拉回上方，
+                        // 这里再补上差值，保证后续正文不会压到文字上。
+                        let before = ui.cursor().top();
+                        let response =
+                            ui.put(rect, egui::Image::new(&texture).fit_to_exact_size(size));
+                        image_clicked |= response.clicked();
+                        let mut line_bottom = ui.cursor().top();
+                        if line_bottom < before {
+                            ui.add_space(before - line_bottom);
+                            line_bottom = ui.cursor().top();
+                        }
+                        // 图片右侧的空白继续排后续正文，文字就绕在插图两侧。
+                        if let Some(ChapterItem::Text(next)) = items.get(item_index + 1) {
+                            let piece_x = rect.right() + INLINE_GAP;
+                            let piece_width = column_right - piece_x;
+                            if let Some((piece_bytes, skip_bytes, piece_height, _)) = inline_follow(
+                                ui,
+                                chapter,
+                                annotations,
+                                next.start,
+                                next.len(),
+                                piece_width,
+                                font_size,
+                                &family,
+                                line_spacing,
+                                interact_height,
+                            ) {
+                                let piece_rect = egui::Rect::from_min_size(
+                                    egui::pos2(piece_x, y),
+                                    egui::vec2(piece_width, piece_height),
+                                );
+                                let id =
+                                    ui.make_persistent_id(("reader_text_inline", index, item_index));
+                                let base = next.start;
+                                let mut piece: &str = &chapter.text[base..base + piece_bytes];
+                                let mut layouter = |ui: &egui::Ui,
+                                                     buffer: &dyn egui::TextBuffer,
+                                                     wrap_width: f32| {
+                                    let job = styled_job(
+                                        ui,
+                                        &chapter.text,
+                                        base,
+                                        buffer.as_str().len().min(piece_bytes),
+                                        spans,
+                                        links,
+                                        annotations,
+                                        highlights,
+                                        font_size,
+                                        &family,
+                                        line_spacing,
+                                        wrap_width,
+                                    );
+                                    ui.fonts_mut(|fonts| fonts.layout_job(job))
+                                };
+                                let inner = ui.scope_builder(
+                                    egui::UiBuilder::new().max_rect(piece_rect),
+                                    |ui| {
+                                        egui::TextEdit::multiline(&mut piece)
+                                            .id(id)
+                                            .font(font_id.clone())
+                                            .frame(egui::Frame::NONE)
+                                            .desired_width(piece_width)
+                                            .desired_rows(1)
+                                            .margin(egui::Margin::symmetric(0, 0))
+                                            .layouter(&mut layouter)
+                                            .show(ui)
+                                    },
+                                );
+                                let piece_chars =
+                                    chapter.text[base..base + piece_bytes].chars().count();
+                                rendered.push(SegmentRender {
+                                    id,
+                                    char_base,
+                                    char_len: piece_chars,
+                                    output: inner.inner,
+                                });
+                                skip = skip_bytes;
+                                // 下一幅行内图可以继续贴在这段续排文字的末尾。
+                                last_text = Some(rendered.len() - 1);
+                                let after_piece = ui.cursor().top();
+                                if after_piece < line_bottom {
+                                    ui.add_space(line_bottom - after_piece);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        ui.add_space(IMAGE_PADDING);
+                        let response =
+                            ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
+                        image_clicked |= response.clicked();
+                        ui.add_space(IMAGE_PADDING);
+                        last_text = None;
+                    }
+                }
+            }
+        }
+    }
+    ChapterRender {
+        segments: rendered,
+        image_clicked,
+    }
+}
+
+/// 滑动窗口的计算结果。
+struct WindowPlan {
+    start: usize,
+    end: usize,
+    offset: f32,
+    /// 本帧回补的章节及其估计高度（用于渲染后校正偏移）。
+    prepended: Option<(usize, f32)>,
+}
+
+/// 计算本帧要挂载的章节区间：丢弃顶部、回补顶部、裁掉底部，并给出校正后的滚动偏移。
+fn plan_window(
+    total: usize,
+    mut start: usize,
+    mut end: usize,
+    mut offset: f32,
+    viewport_height: f32,
+    heights: &std::collections::HashMap<usize, f32>,
+    fallback_height: f32,
+    separator_height: f32,
+    allow_prepend: bool,
+) -> WindowPlan {
+    if total == 0 {
+        return WindowPlan {
+            start: 0,
+            end: 0,
+            offset,
+            prepended: None,
+        };
+    }
+    start = start.min(total - 1);
+    end = end.clamp(start, total - 1);
+
+    // 顶部章节离可视区至少两屏时才丢弃，保留一屏以上的回滚余量。
+    while start < end {
+        let Some(&height) = heights.get(&start) else {
+            break;
+        };
+        let block = height + separator_height;
+        if height <= 1.0 || offset - block < viewport_height * (1.0 + DROP_BUFFER) {
+            break;
+        }
+        offset -= block;
+        start += 1;
+    }
+
+    // 滚到窗口顶部时回补上一章；未知章高先用均值估计。
+    // 首帧还没有实测正文宽度（预排版会失准），先不回补，等下一帧再补。
+    let mut prepended = None;
+    if allow_prepend && start > 0 && offset < PREPEND_EDGE {
+        // 未知章高优先借用相邻章节的高度，其次才用全局均值。
+        let height = heights
+            .get(&(start - 1))
+            .or_else(|| heights.get(&start))
+            .copied()
+            .unwrap_or(fallback_height);
+        start -= 1;
+        offset += height + separator_height;
+        prepended = Some((start, height));
+    }
+
+    // 向上阅读时裁掉远在可视区下方的章节，避免窗口无限变长（只在章高已知时判断）。
+    let bottom_limit = offset + viewport_height * (1.0 + BOTTOM_BUFFER);
+    if end > start {
+        let mut cursor_y = 0.0;
+        let mut keep_end = start;
+        let mut reached = false;
+        for index in start..=end {
+            let Some(&height) = heights.get(&index) else {
+                break;
+            };
+            if cursor_y > bottom_limit {
+                reached = true;
+                break;
+            }
+            cursor_y += height + separator_height;
+            keep_end = index;
+        }
+        if reached && keep_end < end {
+            end = keep_end;
+        }
+    }
+
+    // 内容不足一屏多时向下补足：总高度不够时 ScrollArea 会把滚动偏移夹小，
+    // 跳到短章节就会停在原处，看起来“下一章无效”。
+    let mut covered: f32 = (start..=end)
+        .map(|index| {
+            heights.get(&index).copied().unwrap_or(fallback_height) + separator_height
+        })
+        .sum();
+    while covered <= bottom_limit && end + 1 < total {
+        end += 1;
+        covered += heights.get(&end).copied().unwrap_or(fallback_height) + separator_height;
+    }
+
+    WindowPlan {
+        start,
+        end,
+        offset,
+        prepended,
+    }
+}
+
+/// 当前可见章节：取章节块顶部不超过可视区顶部（带少量容差）的最后一章。
+/// 容差用于回补上一章后目标章节恰好贴在可视区顶部时的浮点误差。
+fn visible_chapter(start: usize, tops: &[(usize, f32)], viewport_top: f32) -> usize {
+    tops.iter()
+        .filter(|(_, top)| *top <= viewport_top + 2.0)
+        .last()
+        .map(|(index, _)| *index)
+        .unwrap_or(start)
+}
+
+impl SepiolaApp {
+    pub fn reader_stream(&mut self, ui: &mut egui::Ui, document: &Arc<BookDocument>) {
+        let total = document.chapters.len();
+        if total == 0 {
+            return;
+        }
+        let viewport_height = ui.available_height().max(1.0);
+        let width = ui.available_width();
+        // 宽度变化会让已测高度全部失效，需要重新测量。
+        if (width - self.library.reader.stream_width).abs() > 0.5 {
+            self.library.reader.stream_width = width;
+            self.library.reader.chapter_heights.clear();
+            self.library.reader.stream_inner_width = 0.0;
+        }
+
+        let font_size = self.library.reader.font_size;
+        let custom_font = self.library.reader.custom_font.is_some();
+        let family = reader_font_family(ui, self.library.reader.font, custom_font);
+        let line_spacing = self.library.reader.line_spacing;
+        let paragraph_spacing = self.library.reader.paragraph_spacing;
+        // 只取当前渲染窗口内各章的缓存分析结果，避免把整本书的彩标都传进来。
+        let show_annotations = self.library.reader.show_annotations;
+
+        let mut offset_override = self.library.reader.pending_offset.take();
+        let offset_before = offset_override.unwrap_or(self.library.reader.stream_offset);
+        // 首帧还没实测正文换行宽度，预排版高度会失准，先允许渲染、下一帧再回补。
+        let measured_width = self.library.reader.stream_inner_width;
+        let has_width = measured_width > 1.0;
+        // 回补目标章高未知时，先按正文同样的字体与换行宽度预排版，
+        // 这样本帧就能用真实高度调整偏移，避免下一帧校正造成的位移。
+        let start_hint = self.library.reader.stream_start.min(total - 1);
+        if has_width
+            && start_hint > 0
+            && offset_before < PREPEND_EDGE
+            && !self
+                .library
+                .reader
+                .chapter_heights
+                .contains_key(&(start_hint - 1))
+        {
+            let target = &document.chapters[start_hint - 1];
+            let annotations = cached_annotations(
+                &self.library.reader.book_analysis,
+                target,
+                start_hint - 1,
+                show_annotations,
+            );
+            let height = measure_chapter_height(
+                ui,
+                target,
+                &annotations,
+                font_size,
+                family.clone(),
+                line_spacing,
+                paragraph_spacing,
+                measured_width,
+            );
+            self.library.reader
+                .chapter_heights
+                .insert(start_hint - 1, height);
+        }
+
+        let plan = plan_window(
+            total,
+            self.library.reader.stream_start,
+            self.library.reader.stream_end,
+            offset_before,
+            viewport_height,
+            &self.library.reader.chapter_heights,
+            self.average_chapter_height(),
+            self.library.reader.separator_height,
+            has_width,
+        );
+        if plan.offset != offset_before {
+            offset_override = Some(plan.offset);
+        }
+        let start = plan.start;
+        let end = plan.end;
+        let prepended = plan.prepended;
+        // 回补被推迟到首帧之后，需要再刷一帧补上。
+        let prepend_deferred =
+            !has_width && self.library.reader.stream_start > 0 && offset_before < PREPEND_EDGE;
+        if prepended.is_some() || prepend_deferred {
+            ui.ctx().request_repaint();
+        }
+        self.library.reader.stream_start = start;
+        self.library.reader.stream_end = end;
+
+        let annotations_by_chapter: HashMap<usize, Vec<Annotation>> = if show_annotations {
+            (start..=end)
+                .filter_map(|index| {
+                    let chapter = document.chapters.get(index)?;
+                    let annotations = cached_annotations(
+                        &self.library.reader.book_analysis,
+                        chapter,
+                        index,
+                        true,
+                    );
+                    (!annotations.is_empty()).then_some((index, annotations))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let generation = self.library.reader.stream_generation;
+        let mut found: Option<Selection> = None;
+        let mut tops: Vec<(usize, f32)> = Vec::new();
+        // 各正文段的排版结果（章节、段首字符序号、段字符数、屏幕左上角、galley），
+        // 用于在帧末换算「中线处的字符锚点」，以及在恢复时滚动到锚点。
+        let mut anchors: Vec<(usize, usize, usize, egui::Pos2, Arc<egui::Galley>)> = Vec::new();
+        let mut measured: Vec<(usize, f32)> = Vec::new();
+        let mut separator_seen = 0.0_f32;
+        // 点中正文（含浮层下方穿透过来的点击）时应关闭工具条。
+        let mut clicked_text = false;
+        // 点中脚注/跨章链接时的目标（章节文本按需跳转或弹出脚注）。
+        let mut clicked_link: Option<LinkTarget> = None;
+        // 点中 AI 彩标时弹出的条目。
+        let mut clicked_annotation: Option<Annotation> = None;
+
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt(("reader_stream", generation))
+            .auto_shrink([false, false]);
+        if let Some(offset) = offset_override {
+            scroll = scroll.vertical_scroll_offset(offset);
+        }
+        let output = scroll.show(ui, |ui| {
+            for index in start..=end {
+                let block_top = ui.cursor().top();
+                let chapter = &document.chapters[index];
+                let annotations: &[Annotation] = annotations_by_chapter
+                    .get(&index)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                // 用户高亮按章过滤后传入（同一章可能有多段）。
+                let highlights: Vec<Highlight> = self
+                    .library
+                    .reader
+                    .highlights
+                    .items
+                    .iter()
+                    .filter(|highlight| highlight.chapter == index)
+                    .copied()
+                    .collect();
+                let render = chapter_block(
+                    ui,
+                    index,
+                    chapter,
+                    annotations,
+                    &highlights,
+                    font_size,
+                    family.clone(),
+                    line_spacing,
+                    paragraph_spacing,
+                    &mut self.library.reader.image_textures,
+                );
+                clicked_text |= render.image_clicked;
+                // 恢复阅读位置：把锚点那一行滚到视口顶部（只做一次）。
+                if self.library.reader.restore_anchor.is_some()
+                    && index == self.library.reader.position_chapter
+                {
+                    let anchor = self.library.reader.restore_anchor.unwrap_or_default();
+                    let target = render
+                        .segments
+                        .iter()
+                        .find(|segment| anchor < segment.char_base + segment.char_len)
+                        .or_else(|| render.segments.last());
+                    if let Some(segment) = target {
+                        let local = anchor
+                            .saturating_sub(segment.char_base)
+                            .min(segment.char_len.saturating_sub(1));
+                        let rect = segment
+                            .output
+                            .galley
+                            .pos_from_cursor(egui::text::CCursor::new(local))
+                            .translate(segment.output.galley_pos.to_vec2());
+                        ui.scroll_to_rect(rect, Some(egui::Align::Min));
+                        ui.ctx().request_repaint();
+                    }
+                    // 渲染不出来（空章）也清掉，避免每帧重复尝试。
+                    self.library.reader.restore_anchor = None;
+                }
+                let segments = render.segments;
+                for segment in &segments {
+                    anchors.push((
+                        index,
+                        segment.char_base,
+                        segment.char_len,
+                        segment.output.galley_pos,
+                        segment.output.galley.clone(),
+                    ));
+                }
+                // 记录章节块（标题）顶部，而不是正文顶部：回补上一章后正文顶部会落到
+                // 可视区下方，用正文顶部判断会把当前章节误判成上一章。
+                tops.push((index, block_top));
+                // 插图把正文切成多段，选区与点击都按段内偏移加段首字符序号换算。
+                let chapter_chars = chapter.text.chars().count();
+                let mut candidate: Option<(bool, Selection)> = None;
+                for segment in &segments {
+                    let text_output = &segment.output;
+                    clicked_text |= text_output.response.response.clicked();
+                    if text_output.response.response.clicked() {
+                        if let Some(range) = text_output.cursor_range {
+                            let char_index = segment.char_base
+                                + range.primary.index.0.min(range.secondary.index.0);
+                            let byte = char_offset(&chapter.text, char_index);
+                            if let Some(annotation) = annotation_at_byte(annotations, index, byte) {
+                                clicked_annotation = Some(annotation.clone());
+                            } else if let Some(target) = link_at_char(chapter, char_index) {
+                                clicked_link = Some(target.clone());
+                            }
+                        }
+                    }
+                    if let Some(range) = text_output.cursor_range {
+                        let first = range.primary.index.0.min(range.secondary.index.0);
+                        let last = range.primary.index.0.max(range.secondary.index.0);
+                        if last > first {
+                            let picked: String = chapter
+                                .text
+                                .chars()
+                                .skip(segment.char_base + first)
+                                .take(last - first)
+                                .collect();
+                            if !picked.trim().is_empty() {
+                                // 记录整个选区的屏幕包围盒（首末光标所在行），工具条贴在它上/下方。
+                                let head = text_output.galley.pos_from_cursor(range.primary);
+                                let tail = text_output.galley.pos_from_cursor(range.secondary);
+                                let offset = text_output.galley_pos.to_vec2();
+                                let focused = text_output.response.response.has_focus();
+                                let selection = Selection {
+                                    text: picked,
+                                    id: segment.id,
+                                    rect: head.union(tail).translate(offset),
+                                    highlight: Some((
+                                        index,
+                                        segment.char_base + first,
+                                        segment.char_base + last,
+                                    )),
+                                };
+                                // 多段各自保留旧的选区状态时，优先采纳当前聚焦的那段。
+                                let keep_existing = candidate.is_some() && !focused;
+                                if !keep_existing {
+                                    candidate = Some((focused, selection));
+                                }
+                            }
+                        }
+                    }
+                    // 从分析结果跳转过来：把选区落到条目上并滚动到它所在的行。
+                    if let Some((target, start_byte, end_byte)) =
+                        self.library.reader.pending_item
+                    {
+                        if target == index {
+                            let start_char = chapter.text
+                                [..start_byte.min(chapter.text.len())]
+                                .chars()
+                                .count();
+                            let end_char = chapter.text[..end_byte.min(chapter.text.len())]
+                                .chars()
+                                .count();
+                            let segment_end = segment.char_base + segment.char_len;
+                            // 起点落在段尾的边界上时属于下一段，避免产生空选区；
+                            // 章末位置仍然由最后一段承接。
+                            let in_segment = start_char >= segment.char_base
+                                && (start_char < segment_end || start_char == chapter_chars);
+                            if in_segment {
+                                let first = start_char - segment.char_base;
+                                let last = end_char
+                                    .saturating_sub(segment.char_base)
+                                    .clamp(first, segment.char_len);
+                                let mut state =
+                                    egui::text_edit::TextEditState::load(ui.ctx(), segment.id)
+                                        .unwrap_or_default();
+                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                                    egui::text::CCursor::new(first),
+                                    egui::text::CCursor::new(last),
+                                )));
+                                state.store(ui.ctx(), segment.id);
+                                let head = text_output
+                                    .galley
+                                    .pos_from_cursor(egui::text::CCursor::new(first));
+                                let rect = head.translate(text_output.galley_pos.to_vec2());
+                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                self.library.reader.pending_item = None;
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+                }
+                if let Some((_, selection)) = candidate {
+                    found = Some(selection);
+                }
+                // 章高不含分隔线；分隔线单独计量，丢弃/回补时再累加。
+                measured.push((index, (ui.cursor().top() - block_top).max(1.0)));
+                if index < end {
+                    let separator_top = ui.cursor().top();
+                    ui.add_space(14.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    separator_seen = (ui.cursor().top() - separator_top).max(0.0);
+                }
+            }
+            ui.add_space(28.0);
+        });
+
+        for (index, height) in measured {
+            self.library.reader.chapter_heights.insert(index, height);
+        }
+        if let Some(annotation) = clicked_annotation {
+            self.library.reader.annotation_detail = Some(annotation);
+        }
+        if separator_seen > 0.0 {
+            self.library.reader.separator_height = separator_seen;
+        }
+        self.library.reader.stream_inner_width = output.inner_rect.width();
+        self.library.reader.stream_offset = output.state.clamped_offset().y;
+
+        // 回补时用的是估计高度，渲染后用实际高度把内容位置校回来。
+        if let Some((index, estimate)) = prepended {
+            if let Some(&actual) = self.library.reader.chapter_heights.get(&index) {
+                let delta = actual - estimate;
+                if delta.abs() > 0.5 {
+                    let corrected = self.library.reader.stream_offset + delta;
+                    self.library.reader.stream_offset = corrected;
+                    // 下一帧强制写回，否则 ScrollArea 内部状态会覆盖校正结果。
+                    self.library.reader.pending_offset = Some(corrected);
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+
+        let viewport_top = output.inner_rect.top();
+        // 用屏幕中线判断「正在读哪一章」：视口顶部残留上一章结尾时不应算上一章，
+        // 否则读到新章前半屏，进度却一直记在旧章（56 被存成 55 的根因）。
+        let visible = visible_chapter(
+            start,
+            &tops,
+            viewport_top + output.inner_rect.height() * 0.5,
+        );
+        // 回补章节的高度是估计值，本帧的块顶位置可能偏；下一帧会按实测高度校正，
+        // 此刻不要用它改当前章节，避免把进度记到上一章。
+        let correcting = self.library.reader.pending_offset.is_some();
+        // 位置锚点：视口顶部那一行文字。恢复时把它滚回视口顶部，与保存完全对称；
+        // 顶部很可能还是上一章的结尾，所以锚点章节与显示章节是两回事。
+        let top_chapter = visible_chapter(start, &tops, viewport_top);
+        let anchor = anchors
+            .iter()
+            .filter(|(chapter, ..)| *chapter == top_chapter)
+            .filter(|(_, _, _, pos, galley)| {
+                pos.y <= viewport_top && pos.y + galley.size().y > viewport_top
+            })
+            .max_by_key(|(_, base, ..)| *base)
+            .map(|(_, base, _, pos, galley)| {
+                let y = (viewport_top - pos.y).clamp(0.0, galley.size().y);
+                *base + galley.cursor_from_pos(egui::vec2(0.0, y)).index.0
+            })
+            // 顶部落在标题/插图/章节间隔里：退回该章第一段的首字符。
+            .or_else(|| {
+                anchors
+                    .iter()
+                    .filter(|(chapter, ..)| *chapter == top_chapter)
+                    .min_by_key(|(_, base, ..)| *base)
+                    .map(|(_, base, ..)| *base)
+            });
+        if !correcting {
+            // 章内偏移：视口顶端到锚点章节块顶的距离（tops 是屏幕坐标，不能与
+            // stream_offset 直接相减）。恢复时以同一基准写回，保证保存/恢复对称。
+            let local = tops
+                .iter()
+                .find(|(index, _)| *index == top_chapter)
+                .map(|(_, top)| (viewport_top - top).max(0.0))
+                .unwrap_or_default();
+            // 算不出锚点（顶部在标题/间隔里）时，同章沿用旧值，换章则作废。
+            let previous_chapter = self.library.reader.position_chapter;
+            let current_anchor = match anchor {
+                Some(anchor) => Some(anchor),
+                None if previous_chapter == top_chapter => self.library.reader.anchor_char,
+                None => None,
+            };
+            let position_changed = match self.library.reader.last_saved_position {
+                Some((chapter, offset, saved_anchor, display)) => {
+                    chapter != top_chapter
+                        || (offset - local).abs() > 0.5
+                        || saved_anchor != current_anchor
+                        || display != visible
+                }
+                None => true,
+            };
+            self.library.reader.chapter_offset = local;
+            self.library.reader.anchor_char = current_anchor;
+            self.library.reader.position_chapter = top_chapter;
+            // 显示用的章节跟随屏幕中线（顶栏、目录高亮、分析入口都用它）。
+            self.library.reader.chapter = visible;
+            // 滚动停稳（松手且没有滚动惯性）后落盘，避免窗口关闭时丢失位移。
+            let settled = ui.input(|input| {
+                !input.pointer.any_down() && input.smooth_scroll_delta.y.abs() < 0.5
+            });
+            if !settled {
+                // 滚动还在进行：稍后再检查一次，保证停稳后一定落盘。
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(150));
+            } else if position_changed {
+                self.save_reader_position();
+            }
+        }
+
+        // 点击工具条本身不算“点击别处”，否则按钮还没处理就被清掉；
+        // 点中正文时即便浮层压在上面也要关闭。
+        let dismiss = found.is_none() && {
+            let clicked = ui.input(|input| input.pointer.any_click());
+            let on_toolbar = !clicked_text
+                && self.library.reader.toolbar_rect.is_some_and(|rect| {
+                    ui.input(|input| {
+                        input
+                            .pointer
+                            .interact_pos()
+                            .is_some_and(|pos| rect.contains(pos))
+                    })
+                });
+            ui.input(|input| input.key_pressed(egui::Key::Escape)) || (clicked && !on_toolbar)
+        };
+
+        if let Some(selection) = found {
+            // 每帧更新锚点：滚动时工具条要跟着选区走，否则会停在不相关的文字上挡住鼠标。
+            self.library.reader.selection = Some(selection);
+        } else if dismiss {
+            self.library.reader.selection = None;
+            self.library.reader.toolbar_rect = None;
+        }
+
+        let remaining =
+            output.content_size.y - (output.state.clamped_offset().y + output.inner_rect.height());
+        if remaining < APPEND_THRESHOLD && end + 1 < total {
+            self.library.reader.stream_end = end + 1;
+            ui.ctx().request_repaint();
+        }
+
+        if self.library.reader.selection.is_some() {
+            self.selection_toolbar(ui);
+        }
+
+        match clicked_link {
+            Some(LinkTarget::Chapter(index)) => self.goto_chapter(index),
+            Some(LinkTarget::Footnote(text)) => {
+                self.library.reader.footnote = Some(text);
+                self.library.reader.selection = None;
+                self.library.reader.toolbar_rect = None;
+            }
+            None => {}
+        }
+    }
+
+    fn average_chapter_height(&self) -> f32 {
+        let heights = &self.library.reader.chapter_heights;
+        if heights.is_empty() {
+            DEFAULT_CHAPTER_HEIGHT
+        } else {
+            heights.values().sum::<f32>() / heights.len() as f32
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sepiola::reader::TextStyle;
+    use std::collections::HashMap;
+
+    fn heights(entries: &[(usize, f32)]) -> HashMap<usize, f32> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn visible_chapter_prefers_target_below_prepended_chapter() {
+        // 回补上一章后，上一章块顶在可视区上方，目标章节块顶正好贴在可视区顶部。
+        let tops = [(4, -820.0), (5, 300.0)];
+        assert_eq!(visible_chapter(4, &tops, 300.0), 5);
+    }
+
+    #[test]
+    fn visible_chapter_falls_back_to_window_start() {
+        assert_eq!(visible_chapter(3, &[], 0.0), 3);
+        // 首章块顶还在可视区下方时仍按窗口起点。
+        assert_eq!(visible_chapter(3, &[(3, 40.0)], 0.0), 3);
+    }
+
+    #[test]
+    fn visible_chapter_keeps_current_while_scrolled_inside() {
+        let tops = [(0, -600.0), (1, -120.0), (2, 260.0)];
+        assert_eq!(visible_chapter(0, &tops, 0.0), 1);
+    }
+
+    #[test]
+    fn drops_chapters_far_above() {
+        let map = heights(&[(0, 1000.0), (1, 1000.0), (2, 1000.0), (3, 1000.0)]);
+        let plan = plan_window(4, 0, 3, 2600.0, 400.0, &map, 800.0, 20.0, true);
+        assert_eq!(plan.start, 1);
+        assert_eq!(plan.offset, 1580.0);
+        assert_eq!(plan.end, 3);
+        assert!(plan.prepended.is_none());
+    }
+
+    #[test]
+    fn keeps_window_while_scrolled_inside_chapter() {
+        let map = heights(&[(0, 1000.0), (1, 1000.0)]);
+        let plan = plan_window(2, 0, 1, 900.0, 400.0, &map, 800.0, 20.0, true);
+        assert_eq!(plan.start, 0);
+        assert_eq!(plan.offset, 900.0);
+    }
+
+    #[test]
+    fn prepends_previous_chapter_at_top() {
+        let map = heights(&[(0, 500.0), (1, 500.0)]);
+        let plan = plan_window(2, 1, 1, 0.0, 400.0, &map, 800.0, 20.0, true);
+        assert_eq!(plan.start, 0);
+        assert_eq!(plan.offset, 520.0);
+        assert_eq!(plan.prepended, Some((0, 500.0)));
+    }
+
+    #[test]
+    fn trims_chapters_far_below() {
+        let map = heights(&[(0, 500.0), (1, 500.0), (2, 500.0), (3, 500.0)]);
+        let plan = plan_window(4, 0, 3, 0.0, 400.0, &map, 800.0, 20.0, true);
+        assert_eq!(plan.start, 0);
+        assert_eq!(plan.end, 1);
+        assert_eq!(plan.offset, 0.0);
+    }
+
+    #[test]
+    fn unknown_heights_fall_back_to_estimate() {
+        let map = HashMap::new();
+        let plan = plan_window(5, 2, 4, 0.0, 400.0, &map, 800.0, 20.0, true);
+        assert_eq!(plan.start, 1);
+        assert_eq!(plan.offset, 820.0);
+        assert_eq!(plan.end, 4);
+    }
+
+    #[test]
+    fn skips_prepend_before_first_measurement() {
+        let map = HashMap::new();
+        let plan = plan_window(5, 2, 4, 0.0, 400.0, &map, 800.0, 20.0, false);
+        assert_eq!(plan.start, 2);
+        assert_eq!(plan.offset, 0.0);
+        assert!(plan.prepended.is_none());
+    }
+
+    #[test]
+    fn extends_window_when_jumping_to_short_chapter() {
+        // 跳到第 2 章时窗口只有 [2]，且这一章很短；不向下补足的话内容总高度不够，
+        // ScrollArea 会把滚动偏移夹小，跳章就停在原处。
+        let map = heights(&[
+            (1, 800.0),
+            (2, 200.0),
+            (3, 200.0),
+            (4, 200.0),
+            (5, 200.0),
+        ]);
+        let plan = plan_window(6, 2, 2, 0.0, 400.0, &map, 800.0, 20.0, true);
+        assert_eq!(plan.start, 1);
+        assert!(plan.end > 2, "短章节要向下补足");
+        let covered: f32 = (plan.start..=plan.end)
+            .map(|index| map.get(&index).copied().unwrap_or(800.0) + 20.0)
+            .sum();
+        assert!(
+            covered > plan.offset + 400.0 * 1.5,
+            "内容高度要覆盖偏移之后至少一屏：{covered} vs {}",
+            plan.offset
+        );
+    }
+
+    #[test]
+    fn estimate_matches_rendered_block_height() {
+        let heading = "第一章 初见\n".to_owned();
+        let body = "The quick brown fox jumps over the lazy dog. ".repeat(400);
+        let bold_start = heading.len() + 4;
+        let chapter = Chapter {
+            title: "Chapter One".to_owned(),
+            text: format!("{heading}{body}"),
+            spans: vec![
+                StyleSpan {
+                    start: 0,
+                    end: heading.trim_end().len(),
+                    style: TextStyle {
+                        bold: true,
+                        heading: 1,
+                        ..TextStyle::default()
+                    },
+                },
+                StyleSpan {
+                    start: bold_start,
+                    end: bold_start + 3,
+                    style: TextStyle {
+                        bold: true,
+                        ..TextStyle::default()
+                    },
+                },
+            ],
+            links: vec![LinkSpan {
+                start: bold_start,
+                end: bold_start + 5,
+                target: LinkTarget::Footnote("note".to_owned()),
+            }],
+            images: Vec::new(),
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(600.0, 800.0),
+        ));
+        let mut sizes: Option<(f32, f32)> = None;
+        let annotations = vec![Annotation {
+            chapter: 0,
+            start: bold_start,
+            end: bold_start + 3,
+            kind: AnnotationKind::Expression,
+            note: "标注".to_owned(),
+            detail: String::new(),
+        }];
+        let mut output = ctx.run_ui(input, |ui| {
+            let family = egui::FontFamily::Proportional;
+            let width = ui.available_width();
+            let estimate = measure_chapter_height(
+                ui,
+                &chapter,
+                &annotations,
+                16.0,
+                family.clone(),
+                1.0,
+                12.0,
+                width,
+            );
+            let top = ui.cursor().top();
+            let mut textures = HashMap::new();
+            chapter_block(ui, 0, &chapter, &annotations, &[], 16.0, family, 1.0, 12.0, &mut textures);
+            sizes = Some((estimate, ui.cursor().top() - top));
+        });
+        // 无渲染后端，纹理增量直接丢弃。
+        output.textures_delta.clear();
+        let (estimate, actual) = sizes.expect("block should be rendered");
+        assert!(
+            (estimate - actual).abs() <= 1.0,
+            "预排版高度 {estimate} 与实际块高 {actual} 相差过大"
+        );
+    }
+
+    #[test]
+    fn estimate_matches_block_with_image() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            40,
+            20,
+            image::Rgba([200, 200, 200, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode png");
+        let chapter = Chapter {
+            title: "带图章节".to_owned(),
+            text: "插图前\n插图后\n".to_owned(),
+            images: vec![ChapterImage {
+                at: "插图前\n".len(),
+                width: Some(40),
+                height: Some(20),
+                data: std::sync::Arc::new(png),
+                ..ChapterImage::default()
+            }],
+            ..Chapter::default()
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(600.0, 800.0),
+        ));
+        let mut sizes: Option<(f32, f32)> = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            let family = egui::FontFamily::Proportional;
+            let width = ui.available_width();
+            let estimate =
+                measure_chapter_height(ui, &chapter, &[], 16.0, family.clone(), 1.0, 0.0, width);
+            let top = ui.cursor().top();
+            let mut textures = HashMap::new();
+            chapter_block(ui, 0, &chapter, &[], &[], 16.0, family, 1.0, 0.0, &mut textures);
+            sizes = Some((estimate, ui.cursor().top() - top));
+        });
+        // 无渲染后端，纹理增量直接丢弃。
+        output.textures_delta.clear();
+        let (estimate, actual) = sizes.expect("block should be rendered");
+        assert!(
+            (estimate - actual).abs() <= 1.0,
+            "带图章节预排版高度 {estimate} 与实际块高 {actual} 相差过大"
+        );
+    }
+
+    #[test]
+    fn estimate_matches_block_with_inline_image() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            24,
+            60,
+            image::Rgba([200, 200, 200, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode png");
+        let chapter = Chapter {
+            title: "行内图".to_owned(),
+            text: "Before this inline picture there is a long sentence that has to keep \
+                   flowing to the right of the picture and then wrap onto the following \
+                   lines, so the height estimate must match the real rendered height."
+                .to_owned(),
+            images: vec![ChapterImage {
+                at: "Before this inline picture".len(),
+                width: Some(24),
+                height: Some(60),
+                inline: true,
+                data: std::sync::Arc::new(png),
+                ..ChapterImage::default()
+            }],
+            ..Chapter::default()
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(600.0, 800.0),
+        ));
+        let mut sizes: Option<(f32, f32, usize)> = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            let family = egui::FontFamily::Proportional;
+            let width = ui.available_width();
+            let estimate =
+                measure_chapter_height(ui, &chapter, &[], 16.0, family.clone(), 1.0, 0.0, width);
+            let top = ui.cursor().top();
+            let mut textures = HashMap::new();
+            let render = chapter_block(ui, 0, &chapter, &[], &[], 16.0, family, 1.0, 0.0, &mut textures);
+            sizes = Some((estimate, ui.cursor().top() - top, render.segments.len()));
+        });
+        output.textures_delta.clear();
+        let (estimate, actual, segments) = sizes.expect("block should be rendered");
+        assert!(
+            (estimate - actual).abs() <= 1.0,
+            "行内图预排版高度 {estimate} 与实际块高 {actual} 相差过大"
+        );
+        // 图片前、图片右侧续排、图片之后的剩余正文，共三段。
+        assert_eq!(segments, 3);
+    }
+
+    #[test]
+    fn consecutive_inline_images_stay_on_one_line() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            20,
+            20,
+            image::Rgba([200, 200, 200, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode png");
+        let first = "One two three four five six seven eight nine ten ";
+        let middle = "alpha beta ";
+        let tail = "zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon \
+                    phi chi psi omega keeps flowing past the line end and wraps below";
+        let image_at = |at: usize| ChapterImage {
+            at,
+            width: Some(20),
+            height: Some(20),
+            inline: true,
+            data: std::sync::Arc::new(png.clone()),
+            ..ChapterImage::default()
+        };
+        let chapter = Chapter {
+            title: "两幅行内图".to_owned(),
+            text: format!("{first}{middle}{tail}"),
+            images: vec![image_at(first.len()), image_at((first.to_owned() + middle).len())],
+            ..Chapter::default()
+        };
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(600.0, 800.0),
+        ));
+        let mut sizes: Option<(f32, f32, usize, f32, f32)> = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            let family = egui::FontFamily::Proportional;
+            let width = ui.available_width();
+            let estimate =
+                measure_chapter_height(ui, &chapter, &[], 16.0, family.clone(), 1.0, 0.0, width);
+            let top = ui.cursor().top();
+            let mut textures = HashMap::new();
+            let render = chapter_block(ui, 0, &chapter, &[], &[], 16.0, family, 1.0, 0.0, &mut textures);
+            // 片段 1 是第一幅图右侧的续排，片段 2 是第二幅图右侧的续排，应在同一行。
+            let y1 = render.segments[1].output.galley_pos.y;
+            let y2 = render.segments[2].output.galley_pos.y;
+            sizes = Some((estimate, ui.cursor().top() - top, render.segments.len(), y1, y2));
+        });
+        output.textures_delta.clear();
+        let (estimate, actual, segments, y1, y2) = sizes.expect("block should be rendered");
+        assert!(
+            (estimate - actual).abs() <= 1.0,
+            "连续行内图预排版高度 {estimate} 与实际块高 {actual} 相差过大"
+        );
+        // 图前正文、第一幅图右侧、第二幅图右侧、换行后的剩余正文，共四段。
+        assert_eq!(segments, 4);
+        assert!(
+            (y1 - y2).abs() <= 1.0,
+            "两幅行内图的续排应在同一行：{y1} vs {y2}"
+        );
+    }
+}

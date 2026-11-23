@@ -6,7 +6,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use eframe::egui;
 use sepiola::config::Config;
-use sepiola::develop::is_raw_format;
+use sepiola::develop::is_developable_format;
 use sepiola::library::{self, FileKind};
 
 use crate::assets::pointing_hand;
@@ -43,8 +43,8 @@ impl SepiolaApp {
         let (event_tx, event_rx) = channel::<DevelopEvent>();
         std::thread::spawn(move || {
             for (rel, config) in task_rx.iter() {
-                let result = library::develop_file(&root, &rel, &config)
-                    .map_err(|error| error.to_string());
+                let result =
+                    library::develop_file(&root, &rel, &config).map_err(|error| error.to_string());
                 if event_tx.send((rel, result)).is_err() {
                     break;
                 }
@@ -72,7 +72,7 @@ impl SepiolaApp {
         true
     }
 
-    /// 当前视图（选中相册或全部）内的 RAW 相对路径。
+    /// 当前视图（选中相册或全部）内可显影图片的相对路径。
     fn raw_targets(&self) -> Vec<PathBuf> {
         self.library
             .index
@@ -80,7 +80,7 @@ impl SepiolaApp {
             .iter()
             .filter(|entry| {
                 entry.kind == FileKind::Image
-                    && is_raw_format(&entry.rel_path)
+                    && is_developable_format(&entry.rel_path)
                     && match &self.library.selected_album {
                         Some(album) => &entry.album == album,
                         None => true,
@@ -90,7 +90,7 @@ impl SepiolaApp {
             .collect()
     }
 
-    /// 当前视图内尚未在途的 RAW 数（供"全部显影"按钮启用与计数）。
+    /// 当前视图内尚未在途的显影任务数（供"全部显影"按钮启用与计数）。
     pub fn pending_raw_count(&self) -> usize {
         self.raw_targets()
             .iter()
@@ -108,8 +108,11 @@ impl SepiolaApp {
             self.library.message = format!("{} 正在显影中…", rel.display());
             return;
         }
-        self.library.message =
-            format!("显影中：{}（后端 {}）", rel.display(), self.backend.as_str());
+        self.library.message = format!(
+            "显影中：{}（后端 {}）",
+            rel.display(),
+            self.backend.as_str()
+        );
     }
 
     /// 批量一键显影：当前视图内所有未在途的 RAW 一次性入队。
@@ -128,10 +131,8 @@ impl SepiolaApp {
         } else if was_running {
             self.library.message = format!("已追加 {queued} 个显影任务…");
         } else {
-            self.library.message = format!(
-                "批量显影中 0/{queued}…（后端 {}）",
-                self.backend.as_str()
-            );
+            self.library.message =
+                format!("批量显影中 0/{queued}…（后端 {}）", self.backend.as_str());
         }
     }
 
@@ -201,20 +202,24 @@ impl SepiolaApp {
         config
     }
 
-    /// 顶栏"全部显影"按钮：当前视图有未在途 RAW 且未扫描时可用。
+    /// 顶栏"全部显影"按钮：当前视图有未在途显影任务且未扫描时可用。
     pub fn develop_button_ui(&mut self, ui: &mut egui::Ui) {
         let pending_raws = self.pending_raw_count();
         let developing = self.library.dev_total > 0;
-        let label = if developing { "显影中…" } else { "全部显影" };
-        let tip = if pending_raws == 0 {
-            "当前视图没有待显影的 RAW"
+        let label = if developing {
+            "显影中…"
         } else {
-            "把当前视图内所有 RAW 一键显影为 JPEG（产物存于 .sepiola/developed/，已显影的自动复用）"
+            "全部显影"
+        };
+        let tip = if pending_raws == 0 {
+            "当前视图没有待显影的 RAW/HEIC/HEIF 图片"
+        } else {
+            "把当前视图内所有 RAW/HEIC/HEIF 图片一键显影为 JPEG（产物存于 .sepiola/developed/，已显影的自动复用）"
         };
         let button = egui::Button::new(label).min_size(egui::vec2(110.0, 26.0));
-        if pointing_hand(ui
-            .add_enabled(pending_raws > 0 && !self.library.scanning, button)
-            .on_hover_text(tip)
+        if pointing_hand(
+            ui.add_enabled(pending_raws > 0 && !self.library.scanning, button)
+                .on_hover_text(tip),
         )
         .clicked()
         {

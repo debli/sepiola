@@ -12,7 +12,7 @@ use ort::value::Tensor;
 use crate::config::SceneTagSettings;
 use crate::error::{Error, Result};
 use crate::imageio::{ImageF32, CHANNELS};
-use crate::library::{ALBUM_BIRTHDAY, ALBUM_PARTY, ALBUM_PLANTS_ANIMALS};
+use crate::library::{ALBUM_ARCHITECTURE, ALBUM_BIRTHDAY, ALBUM_PARTY, ALBUM_PLANTS_ANIMALS};
 use crate::scene::face::ort_environment;
 
 /// torchvision 标准输入尺寸与归一化参数。
@@ -60,6 +60,28 @@ const FOOD_CLASSES: [&str; 7] = [
 
 /// 屏幕/电脑外设类：截图、PPT 照片等归入"截图/文档"（M34，修复误入风景）。
 const SCREEN_DOC_CLASSES: [&str; 4] = ["screen", "desktop computer", "notebook", "computer keyboard"];
+
+/// ImageNet 中高置信度建筑类，归入"建筑"相册。
+///
+/// Places365 对室外建筑照片常常给出偏低的 top-1 置信度（如大楼照片被判
+/// `hotel/outdoor` 0.15），而 ImageNet 的教堂/城堡/桥/灯塔等类反而很确定。
+const ARCHITECTURE_CLASSES: [&str; 15] = [
+    "monastery",
+    "castle",
+    "palace",
+    "church",
+    "dome",
+    "triumphal arch",
+    "viaduct",
+    "steel arch bridge",
+    "suspension bridge",
+    "barn",
+    "boathouse",
+    "lighthouse",
+    "dam",
+    "water tower",
+    "mosque",
+];
 
 /// top-1 标签结果。
 #[derive(Clone, Debug, PartialEq)]
@@ -184,6 +206,9 @@ pub fn album_for_class(index: usize, class: &str) -> Option<&'static str> {
     if SCREEN_DOC_CLASSES.contains(&class) {
         return Some(crate::library::ALBUM_SCREEN_DOC);
     }
+    if ARCHITECTURE_CLASSES.contains(&class) {
+        return Some(ALBUM_ARCHITECTURE);
+    }
     None
 }
 
@@ -304,6 +329,13 @@ mod tests {
         );
         assert_eq!(album_for_class(403, "aircraft carrier"), None);
         assert_eq!(album_for_class(947, "mushroom"), Some(ALBUM_PLANTS_ANIMALS));
+        // ImageNet 建筑类应归入"建筑"，避免 Places 低置信度漏检。
+        assert_eq!(album_for_class(663, "monastery"), Some(ALBUM_ARCHITECTURE));
+        assert_eq!(album_for_class(888, "viaduct"), Some(ALBUM_ARCHITECTURE));
+        assert_eq!(
+            album_for_class(483, "castle"),
+            Some(ALBUM_ARCHITECTURE)
+        );
     }
 
     #[test]

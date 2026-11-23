@@ -20,8 +20,14 @@ pub struct UserSettings {
     pub model_path: String,
     pub portrait_lut: String,
     pub portrait_strength: f32,
+    pub portrait_look: String,
+    pub portrait_look_strength: f32,
+    pub portrait_exposure_ev: f32,
     pub other_lut: String,
     pub other_strength: f32,
+    pub other_look: String,
+    pub other_look_strength: f32,
+    pub other_exposure_ev: f32,
     pub pixel_format: String,
     pub keep_metadata: bool,
     pub identity_enabled: bool,
@@ -31,6 +37,31 @@ pub struct UserSettings {
     pub gallery_file: String,
     pub library_root: String,
     pub recent_library_roots: Vec<String>,
+    /// 设置页：词典地址模板，如 `eudic://dict/{word}`。
+    pub dictionary_url: String,
+    /// 设置页：AI 后端类型（api / gemini / copilot / command）。
+    pub ai_provider: String,
+    /// 设置页：HTTP 代理地址（如 `http://127.0.0.1:7890`），留空不使用。
+    pub proxy_http: String,
+    /// 设置页：HTTPS 代理地址，留空时回退 HTTP 代理。
+    pub proxy_https: String,
+    /// 设置页：AI 翻译/解释接口（留空时回退到 config.toml 的 `[reader.ai]`）。
+    pub ai_base_url: String,
+    pub ai_api_key: String,
+    pub ai_model: String,
+    /// CLI 路径与参数（copilot / command 后端使用）。
+    pub ai_cli_path: String,
+    pub ai_cli_args: String,
+    /// Copilot 使用的模型（`--model`）；留空回退 `gpt-6-luna`。
+    pub ai_cli_model: String,
+    /// 设置页：各功能的提示词覆盖，留空使用内置默认提示词。
+    pub ai_prompt_translate: String,
+    pub ai_prompt_explain: String,
+    pub ai_prompt_analyze: String,
+    pub ai_prompt_exercise: String,
+    pub ai_prompt_sentence: String,
+    pub ai_prompt_card: String,
+    pub ai_prompt_chat: String,
 }
 
 impl Default for UserSettings {
@@ -46,8 +77,14 @@ impl Default for UserSettings {
             model_path: String::new(),
             portrait_lut: String::new(),
             portrait_strength: 0.4,
+            portrait_look: String::new(),
+            portrait_look_strength: 0.75,
+            portrait_exposure_ev: 0.0,
             other_lut: String::new(),
             other_strength: 0.7,
+            other_look: String::new(),
+            other_look_strength: 0.75,
+            other_exposure_ev: 0.0,
             pixel_format: "8bit".to_string(),
             keep_metadata: true,
             identity_enabled: true,
@@ -57,6 +94,23 @@ impl Default for UserSettings {
             gallery_file: "identities.json".to_string(),
             library_root: String::new(),
             recent_library_roots: Vec::new(),
+            dictionary_url: String::new(),
+            ai_provider: "api".to_string(),
+            proxy_http: String::new(),
+            proxy_https: String::new(),
+            ai_base_url: String::new(),
+            ai_api_key: String::new(),
+            ai_model: String::new(),
+            ai_cli_path: "copilot".to_string(),
+            ai_cli_args: "-p".to_string(),
+            ai_cli_model: "gpt-6-luna".to_string(),
+            ai_prompt_translate: String::new(),
+            ai_prompt_explain: String::new(),
+            ai_prompt_analyze: String::new(),
+            ai_prompt_exercise: String::new(),
+            ai_prompt_sentence: String::new(),
+            ai_prompt_card: String::new(),
+            ai_prompt_chat: String::new(),
         }
     }
 }

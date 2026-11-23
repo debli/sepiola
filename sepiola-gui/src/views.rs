@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use crate::assets::{base_name, pick_dir, pick_row, pointing_hand};
+use crate::assets::{base_name, pick_dir, pick_row, pointing_hand, LookPreview};
 use crate::state::{BackendChoice, ClassifierChoice, PixelFormat, SepiolaApp};
 
 impl SepiolaApp {
@@ -108,9 +108,31 @@ impl SepiolaApp {
         ui.add(egui::Slider::new(&mut self.other_strength, 0.0..=1.0).text("其他强度"));
 
         ui.separator();
+        ui.heading("风格与曝光模板");
+        ui.label("按人像/其他场景分别套用；可与自定义 LUT 叠加。");
+        look_controls(
+            ui,
+            "人像风格",
+            &mut self.portrait_look,
+            &mut self.portrait_look_strength,
+            &mut self.portrait_exposure_ev,
+            &self.look_previews,
+            true,
+        );
+        look_controls(
+            ui,
+            "其他风格",
+            &mut self.other_look,
+            &mut self.other_look_strength,
+            &mut self.other_exposure_ev,
+            &self.look_previews,
+            false,
+        );
+
+        ui.separator();
         ui.add_enabled_ui(!self.running, |ui| {
-            if pointing_hand(ui
-                .add_sized([ui.available_width(), 32.0], egui::Button::new("开始处理"))
+            if pointing_hand(
+                ui.add_sized([ui.available_width(), 32.0], egui::Button::new("开始处理")),
             )
             .clicked()
             {
@@ -124,9 +146,9 @@ impl SepiolaApp {
                 "取消处理"
             })
             .min_size(egui::vec2(ui.available_width(), 28.0));
-            if pointing_hand(ui
-                .add_enabled(!self.cancelling, cancel)
-                .on_hover_text("已开始的图片会跑完，未开始的跳过")
+            if pointing_hand(
+                ui.add_enabled(!self.cancelling, cancel)
+                    .on_hover_text("已开始的图片会跑完，未开始的跳过"),
             )
             .clicked()
             {
@@ -171,10 +193,8 @@ impl SepiolaApp {
             if pointing_hand(ui.button("全不选")).clicked() {
                 self.set_all_kept(false);
             }
-            if pointing_hand(ui
-                .add_enabled(!self.running, egui::Button::new("删除未保留"))
-            )
-            .clicked()
+            if pointing_hand(ui.add_enabled(!self.running, egui::Button::new("删除未保留")))
+                .clicked()
             {
                 self.delete_unkept();
             }
@@ -199,9 +219,10 @@ impl SepiolaApp {
 
                         for index in 0..self.rows.len() {
                             let row = &mut self.rows[index];
-                            if pointing_hand(ui
-                                .selectable_label(self.selected == Some(index), base_name(&row.input))
-                            )
+                            if pointing_hand(ui.selectable_label(
+                                self.selected == Some(index),
+                                base_name(&row.input),
+                            ))
                             .clicked()
                             {
                                 clicked = Some(index);
@@ -228,12 +249,13 @@ impl SepiolaApp {
 
                             match &row.person {
                                 Some(label) => {
-                                    let button = pointing_hand(ui
-                                        .selectable_label(
+                                    let button = pointing_hand(
+                                        ui.selectable_label(
                                             self.person_edit == Some(index),
                                             label.as_str(),
                                         )
-                                        .on_hover_text("点击可重命名/合并/删除人物"));
+                                        .on_hover_text("点击可重命名/合并/删除人物"),
+                                    );
                                     if button.clicked() {
                                         edit_person = Some(index);
                                     }
@@ -272,7 +294,13 @@ impl SepiolaApp {
                     ui.image((preview.texture.id(), size * scale));
                 });
                 if pointing_hand(ui.button("放大查看")).clicked() {
-                    let width = self.preview.as_ref().expect("preview").texture.size_vec2().x;
+                    let width = self
+                        .preview
+                        .as_ref()
+                        .expect("preview")
+                        .texture
+                        .size_vec2()
+                        .x;
                     self.zoom_scale = (760.0 / width).clamp(0.1, 1.0);
                     self.zoom_open = true;
                 }
@@ -299,4 +327,58 @@ impl SepiolaApp {
         ui.separator();
         self.results_ui(ui);
     }
+}
+
+fn look_controls(
+    ui: &mut egui::Ui,
+    label: &str,
+    preset: &mut String,
+    strength: &mut f32,
+    exposure_ev: &mut f32,
+    previews: &[LookPreview],
+    portrait: bool,
+) {
+    ui.label(label);
+    if pointing_hand(ui.selectable_label(preset.is_empty(), "关闭")).clicked() {
+        preset.clear();
+        *exposure_ev = 0.0;
+    }
+    egui::Grid::new(format!("look-preview-{label}"))
+        .num_columns(3)
+        .spacing(egui::vec2(6.0, 6.0))
+        .show(ui, |ui| {
+            for (index, preview) in previews.iter().enumerate() {
+                let texture = if portrait {
+                    &preview.portrait
+                } else {
+                    &preview.other
+                };
+                let selected = *preset == preview.preset.id();
+                ui.vertical(|ui| {
+                    let image = egui::Image::new((texture.id(), egui::vec2(96.0, 64.0)))
+                        .sense(egui::Sense::click());
+                    let image_clicked =
+                        pointing_hand(ui.add(image).on_hover_text(preview.preset.label()))
+                            .clicked();
+                    let label_clicked =
+                        pointing_hand(ui.selectable_label(selected, preview.preset.label()))
+                            .clicked();
+                    if image_clicked || label_clicked {
+                        *preset = preview.preset.id().to_string();
+                        *exposure_ev = preview.preset.default_exposure_ev();
+                    }
+                });
+                if index % 3 == 2 {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.add_enabled_ui(!preset.is_empty(), |ui| {
+        ui.add(egui::Slider::new(strength, 0.0..=1.0).text(format!("{label}强度")));
+        ui.add(
+            egui::Slider::new(exposure_ev, -2.0..=2.0)
+                .step_by(0.1)
+                .text(format!("{label}曝光 EV")),
+        );
+    });
 }

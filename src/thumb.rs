@@ -53,16 +53,12 @@ pub fn generate(root: &Path, rel: &Path, max_side: u32) -> Result<Option<PathBuf
             return Ok(Some(out));
         }
     }
-    let decoded = match image::open(&src) {
-        Ok(image) => image,
-        Err(_) => {
-            // RAW 等不可直接解码的源：若已一键显影则用产物。
-            let developed = crate::library::developed_path(root, rel);
-            match image::open(&developed) {
-                Ok(image) => image,
-                Err(_) => return Ok(None),
-            }
-        }
+    let decoded = crate::imageio::load_dynamic(&src).or_else(|_| {
+        // RAW 等不可直接解码的源：若已一键显影则用产物。
+        crate::imageio::load_dynamic(&crate::library::developed_path(root, rel))
+    });
+    let Ok(decoded) = decoded else {
+        return Ok(None);
     };
     let rgb = decoded.to_rgb8();
     let small = image::imageops::thumbnail(&rgb, max_side, max_side);

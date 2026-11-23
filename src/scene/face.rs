@@ -59,7 +59,11 @@ impl FaceClassifier {
             kind: SceneKind::Other,
             faces,
         };
-        let kind = if info.largest_face_ratio() >= self.portrait_min_face_ratio {
+        // 合影中单张脸占比很小，不能只看最大脸；多张脸合计面积达标同样判人像。
+        let total_face_ratio: f32 = info.faces.iter().map(FaceBox::area).sum();
+        let kind = if info.largest_face_ratio() >= self.portrait_min_face_ratio
+            || (info.faces.len() >= 2 && total_face_ratio >= self.portrait_min_face_ratio)
+        {
             SceneKind::Portrait
         } else {
             SceneKind::Other
@@ -129,7 +133,7 @@ pub(crate) fn ort_environment() -> Result<&'static Environment> {
     let library = runtime_library().ok_or_else(|| {
         Error::Model(
             "onnxruntime library not found; set SEPIOLA_ONNXRUNTIME, or place \
-             libonnxruntime.so in <exe_dir>/lib/ or <exe_dir>/, or install it under \
+             libonnxruntime.so / onnxruntime.dll in <exe_dir>/lib/ or <exe_dir>/, or install it under \
              /usr/lib/x86_64-linux-gnu/"
                 .to_string(),
         )
@@ -162,12 +166,13 @@ pub(crate) fn runtime_library() -> Option<PathBuf> {
             }
         }
     }
-    const CANDIDATES: [&str; 5] = [
+    const CANDIDATES: &[&str] = &[
         "/usr/lib/x86_64-linux-gnu/libonnxruntime.so.1.23",
         "/usr/lib/x86_64-linux-gnu/libonnxruntime.so",
         "/usr/local/lib/libonnxruntime.so",
         "/usr/lib/libonnxruntime.so",
         "/opt/homebrew/lib/libonnxruntime.dylib",
+        "C:/onnxruntime/bin/onnxruntime.dll",
     ];
     CANDIDATES
         .iter()
@@ -175,7 +180,8 @@ pub(crate) fn runtime_library() -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// 在目录中查找 `libonnxruntime.so*`，优先无版本后缀的文件。
+/// 在目录中查找 onnxruntime 动态库（`libonnxruntime.so*` / `onnxruntime*.dll` /
+/// `libonnxruntime*.dylib`），优先无版本后缀的文件。
 fn find_library_in_dir(dir: &Path) -> Option<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -186,12 +192,21 @@ fn find_library_in_dir(dir: &Path) -> Option<PathBuf> {
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| name.starts_with("libonnxruntime.so"))
+                    .map(is_onnxruntime_library)
                     .unwrap_or(false)
         })
         .collect();
     found.sort();
     found.into_iter().next()
+}
+
+/// 文件名是否为 onnxruntime 动态库（Linux `.so`、Windows `.dll`、macOS `.dylib`）。
+fn is_onnxruntime_library(name: &str) -> bool {
+    (name.starts_with("libonnxruntime.so")
+        || name.starts_with("libonnxruntime") && name.ends_with(".dylib")
+        || name.starts_with("onnxruntime") && name.ends_with(".dll"))
+        && !name.ends_with(".lib")
+        && !name.ends_with(".pdb")
 }
 
 /// 缩放使长边不超过 `INPUT_SIDE`，再顶左对齐补零到 `INPUT_SIDE`×`INPUT_SIDE`，
@@ -371,6 +386,18 @@ mod tests {
             data.extend_from_slice(&color);
         }
         ImageF32::from_data(width, height, data).expect("valid image")
+    }
+
+    #[test]
+    fn onnxruntime_library_names_match_all_platforms() {
+        assert!(is_onnxruntime_library("libonnxruntime.so"));
+        assert!(is_onnxruntime_library("libonnxruntime.so.1.23"));
+        assert!(is_onnxruntime_library("libonnxruntime.1.23.dylib"));
+        assert!(is_onnxruntime_library("onnxruntime.dll"));
+        assert!(!is_onnxruntime_library("onnxruntime.lib"));
+        assert!(!is_onnxruntime_library("onnxruntime.pdb"));
+        assert!(!is_onnxruntime_library("libonnxruntime-common.a"));
+        assert!(!is_onnxruntime_library("README.md"));
     }
 
     #[test]

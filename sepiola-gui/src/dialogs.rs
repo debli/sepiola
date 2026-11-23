@@ -99,12 +99,12 @@ impl SepiolaApp {
                                 }
                             });
                         pointing_hand(response.response);
-                        if pointing_hand(ui
-                            .add_enabled(
+                        if pointing_hand(
+                            ui.add_enabled(
                                 !self.merge_target.is_empty(),
                                 egui::Button::new("合并"),
                             )
-                            .on_hover_text("把当前人物的嵌入与输出文件并入所选人物")
+                            .on_hover_text("把当前人物的嵌入与输出文件并入所选人物"),
                         )
                         .clicked()
                         {
@@ -115,9 +115,9 @@ impl SepiolaApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     pointing_hand(ui.checkbox(&mut self.remove_delete_dir, "同时删除输出目录"));
-                    if pointing_hand(ui
-                        .button("删除人物")
-                        .on_hover_text("从图库删除该人物；勾选后同时删除其输出子目录")
+                    if pointing_hand(
+                        ui.button("删除人物")
+                            .on_hover_text("从图库删除该人物；勾选后同时删除其输出子目录"),
                     )
                     .clicked()
                     {

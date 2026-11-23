@@ -166,8 +166,7 @@ impl SepiolaApp {
         match Gallery::load(&gallery_path) {
             Ok(mut gallery) => {
                 if !gallery.merge(&src, &target) {
-                    self.message =
-                        format!("图库中不存在 {src} 或 {target}，合并已取消");
+                    self.message = format!("图库中不存在 {src} 或 {target}，合并已取消");
                     return;
                 }
                 if let Err(error) = gallery.save(&gallery_path) {

@@ -1,12 +1,15 @@
 # Sepiola 计划完成记录
 
 - 记录日期：2026-10-26
+- 记录日期：2026-10-30
 - 依据：`ARCHITECTURE.md` 第 5 节、`TASK_PLAN.md`
 - 结论：**M0～M17 均已完成并通过自动化验证；M8 在项目内 15 张人像 + 15 张风景测试集上 30/30 分类正确（准确率 100%）；M9 递归目录扫描与输出目录排除验证通过；M10 ONNX Runtime 随包分发路径查找验证通过；M11 无配置文件运行与显式缺失文件报错验证通过；M12 模型按 exe 同目录解析验证通过；M13 LUT 按 exe 同目录优先、工作目录回退验证通过；M14 config.toml 按 exe 同目录优先、工作目录回退验证通过；M15 显影后端可切换，darktable 缺失时自动回退内置后端并验证成功；M16 使用真实 Nikon D70 NEF 样本完成内置后端端到端测试；M17 新增 egui 桌面界面，GUI 可正常启动并复用 CLI 核心流程；M18 导出选项（pixel_format/keep_metadata）可配置并端到端验证；M19 导出结果支持放大查看、保留勾选与批量删除；M20 支持一键用系统文件管理器打开输出目录；M21 人物身份识别端到端验证通过——同一人两张图归入同一子目录、不同人分开，二次运行复用图库标签；M22 五点关键点对齐使同人跨构图余弦从 ~0.7 提升到 0.97+；M23 gallery 多嵌入增量更新与合并/删除单测与端到端验证通过；M24 GUI 拆分为 7 个模块（各 <250 行）；M25 GUI 支持人物合并/删除与关键点模型设置项；M26 补齐示例 LUT 文件、批次取消、参数保存/载入与目录拖拽导入；M27 引入 LFW 子集评测集（52 位人物 / 80 张）并新增 `sepiola-eval` 阈值扫描工具，实测配置阈值 0.35 即为 F1 最佳（0.980）。M28 引入媒体库（库目录按类型归类、图片自动分相册、浏览/重打标签，CLI + GUI 库页签）并加大 GUI 组件间距；M29 接入 ImageNet 场景标签模型（MobileNetV2 ONNX），非人像图片自动细分到「植物动物/生日/聚会」相册，6 张官方样本 top-1 全部正确。M30 修复库页签三大缺陷：文件列表 `show_rows` 虚拟化（万级目录只渲染可见行）、点击行右侧即时预览解码图、右键菜单支持打开所在目录/复制路径/移动到相册/从索引移除。M31 落地后台缩略图生成与磁盘缓存：库页签文件列表行内显示 40×40 缩略图，缓存于 `<库>/.sepiola/thumbs/`（FNV-1a 哈希命名、按 mtime 判新鲜），单个后台线程惰性生成、UI 轮询加载纹理。M32 实现库内 RAW 一键显影：RAW 行右键「显影为 JPEG」，产物镜像目录存于 `<库>/.sepiola/developed/`（幂等复用），显影后预览与缩略图自动联动刷新。M33 落地库内 RAW 批量一键显影：库页签「全部显影」按钮按当前视图批量入队，单个后台 worker 顺序显影（进度条 + 成功/失败统计），已显影产物幂等复用。M34 场景分类细化：引入 Places365 场景模型（resnet18 ONNX），新增 建筑/交通工具/美食/运动/冒险/探险/截图·文档 相册，风景改为显式自然类映射，彻底移除"无脸一律风景"兜底（PPT 截图误入风景缺陷修复），旧索引 v2 全量重归类迁移。M35 库第一级文件类型总览：FileKind 扩展 书籍/录音/驱动/安装包/项目/游戏，项目与游戏目录按标记文件折叠为单个实体（内部文件不入库），库页先显示各类型计数卡片、点「图片」进入浏览页，索引 v4 全量重判类型迁移。M38 书籍元信息分面筛选与正文检索已落地：分面去重并按频次排序、多个字段可组合、文字默认搜索所有元信息，勾选后异步检索 EPUB/PDF/FB2/PalmDOC MOBI 正文；核心正文测试 10 项、GUI 测试 7 项通过。**
 
 ## 1. 里程碑完成情况
 
 M37 已完成：设置持久化、启动恢复和最近书库切换已实现；M38 已完成：图书分面筛选、元信息搜索与显式启用的异步正文搜索已实现。自动化验证见 §2.30、§2.31；图形环境手动交互尚未验证。
+
+补录：M39 记录此前遗漏的 HEIC/HEIF、MobileCLIP、书籍处理拆分、调色风格模板/预览图及递归扫描取消修复。M40 双目录比较、同步与精确重复清理已实现；IDE 诊断和依赖元数据解析通过，测试、构建与图形交互尚未验证。
 
 | 里程碑 | 状态 | 交付文件 | 验收结果 |
 | --- | --- | --- | --- |
@@ -49,6 +52,11 @@ M37 已完成：设置持久化、启动恢复和最近书库切换已实现；M
 | M36 电子书内容级元数据抽取 | 已完成 | `src/book.rs`、`src/library.rs`、`sepiola-gui/src/{books_view,library,library_overview,main}.rs`、`Cargo.toml` | 新增 zip/quick-xml/pdf-extract 依赖；EPUB（container.xml→OPF Dublin Core + 版权页文本启发式）、FB2（title-info）、MOBI/AZW3（PalmDOC/EXTH 手写解析，100/101/102/106/503 记录）、PDF（文本层启发式）抽取 书名/作者/出版社/年份/译者/版本/ISBN；`LibraryEntry.book_meta` 入库，索引 v5 回填旧书籍条目；GUI 总览"书籍"卡片进入 8 列元数据表格页；129 项测试通过（book 7 项含合成 fixture 与文本层 PDF）、CLI FB2 端到端元数据正确、GUI 冒烟存活 |
 | M37 GUI 用户设置持久化与最近书库 | 已完成 | `sepiola-gui/src/{user_settings,state,library,library_overview,main}.rs`、`sepiola-gui/Cargo.toml` | JSON 配置按平台写入用户配置目录；恢复处理参数与当前书库，最近 8 个目录去重并支持下拉切换；picker/拖放/扫描共用书库切换；4 项 GUI 单测通过，`cargo check -p sepiola-gui` 零告警 |
 | M38 书籍元信息筛选与正文搜索 | 已完成 | `src/book.rs`、`Cargo.toml`、`sepiola-gui/src/{book_filters,book_search,book_search_view,books_table,books_view,library,main}.rs` | 格式/作者/出版社/年份/译者/版本/ISBN 分面去重并按频次倒排；书名仍参与默认文字搜索、不生成下拉选项；元信息与文件名不区分大小写搜索；分面取交集，正文与元信息结果取并集；正文默认关闭，后台可取消；11 项核心测试、7 项 GUI 测试通过 |
+| M39 遗漏功能补录与递归扫描取消 | 已完成 | `src/imageio.rs`、`src/library.rs`、`src/scene/`、`src/book.rs`、`sepiola-gui/src/`、`luts/` | 补录 HEIC/HEIF 解码、MobileCLIP 场景能力、书籍模块拆分及风格模板/预览图；递归枚举阶段响应取消，取消时不保存部分索引；本次 IDE 诊断通过，未重跑相关模型/端到端测试 |
+| M40 双目录比较、同步与重复清理 | 已实现，待验证 | `sepiola-gui/src/{compare,compare_engine,main,state,library}.rs`、`sepiola-gui/Cargo.toml`、`Cargo.lock` | 四类比较、后台取消、双向分类同步、SHA-256 精确副本预览与二次确认删除已接入；图片相似项仅提示；IDE 诊断与 `cargo metadata` 通过；未运行测试/构建，未做 GUI 手动验证 |
+| M41 音频元数据入库与浏览 | 部分实现 | `src/audio.rs`、`src/library.rs`、`sepiola-gui/src/{library,library_overview,music_view,main}.rs` | Lofty 标签模型、惰性索引抽取任务、音乐页搜索/乐章号排序已实现；音频解析 2 项、索引兼容/延迟重试 2 项、GUI 测试 13 项通过；音频格式 fixture、分面筛选及手动交互仍待补验 |
+| M42 AcoustID 离线录音指纹库 | Rust 实现，待验证 | `src/acoustid.rs`、`src/bin/sepiola-acoustid.rs` | 纯 Rust Chromaprint 与 Symphonia 音频解码替代 `fpcalc`；Rust CLI 覆盖代理/重试下载、SQLite 元数据导入、fpindex 批量更新与本地录音候选查询。当前环境未执行 Cargo 构建；完整数据导入及真实识别仍需下载所需历史流并运行本地 `fpindex`。AcoustID 只匹配录音，不等于跨演奏作品识别 |
+| M43 古典作品与乐章归组 | 计划中 | 后续作品元数据与 GUI 模块 | 尚未实现；需有限曲库评估候选识别，不能将 AcoustID 录音匹配等同于跨演奏作品识别 |
 
 ## 2. 验证记录
 
@@ -572,6 +580,13 @@ cargo test --workspace     # 134 passed, 1 failed（既有目录扫描测试，�
 - GUI 搜索模块拆分后各模块 250 行以内；新增分面排序、任意字段/路径搜索、分面组合和正文格式解压测试。
 - workspace 唯一失败为未改动的 `library::tests::scan_collapses_project_and_game_dirs`：测试取消扫描后仍期待索引版本为 8（实际为 0），单独复跑可复现；与本次图书检索代码无关。
 - `rustfmt` 对本次新增/重写 GUI 搜索模块执行格式化；`src/book.rs` 全文件检查仍报告既有格式差异，未对旧代码做整文件重排。未在图形环境手动检查界面交互。
+
+### 2.32 M39/M40 补录与比较功能状态
+
+- M39 的 HEIC/HEIF、MobileCLIP、书籍处理拆分、调色风格模板/预览图为已有实现的追溯补录；本次另修复递归扫描阶段取消传播及取消时误保存部分结果的问题。扫描相关 IDE 诊断通过；本次未运行测试或构建。
+- M40 增加 SHA-256 与 Lofty 依赖，`cargo metadata --format-version 1` 成功解析并更新锁文件；GUI/比较引擎 IDE 诊断无错误。
+- M40 已添加比较字段和相似度边界单测，但未运行测试；未运行 `cargo check`/build，未在图形环境验证目录选择、同步确认、取消或删除交互。
+- 清理范围限定为当前分类内的 SHA-256 完全相同文件，预览和执行前均检查；图片感知相似候选不会进入删除列表。A/B 路径在操作期间锁定，并拒绝目录相同或互为父子关系。
 
 ## 3. 与计划的差异及原因
 

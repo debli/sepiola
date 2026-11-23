@@ -142,8 +142,10 @@ mod tests {
                 author: Some(author.to_string()),
                 ..BookMeta::default()
             }),
+            audio_meta: None,
             image_classification_version: 0,
             book_metadata_attempted: true,
+            audio_metadata_attempted: false,
         }
     }
 

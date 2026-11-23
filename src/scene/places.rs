@@ -162,6 +162,7 @@ pub fn album_for_places_class(class: &str) -> Option<&'static str> {
         | "rice_paddy"
         | "hayfield"
         | "tree_farm"
+        | "park"
         | "promenade"
         | "boardwalk"
         | "swimming_hole"
@@ -264,11 +265,12 @@ pub fn album_for_places_class(class: &str) -> Option<&'static str> {
         | "alley"
         | "crosswalk"
         | "plaza"
-        | "park"
         | "amphitheater"
         | "barn"
         | "boathouse"
         | "fire_station"
+        | "courtyard"
+        | "roof_garden"
         | "hotel/outdoor"
         | "inn/outdoor"
         | "motel"
@@ -430,6 +432,7 @@ mod tests {
     fn places_album_mapping() {
         assert_eq!(album_for_places_class("beach"), Some(ALBUM_SCENERY));
         assert_eq!(album_for_places_class("lake/natural"), Some(ALBUM_SCENERY));
+        assert_eq!(album_for_places_class("park"), Some(ALBUM_SCENERY));
         assert_eq!(album_for_places_class("canyon"), Some(ALBUM_EXPLORE));
         assert_eq!(album_for_places_class("amusement_park"), Some(ALBUM_ADVENTURE));
         assert_eq!(

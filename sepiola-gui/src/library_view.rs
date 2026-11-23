@@ -69,7 +69,7 @@ impl SepiolaApp {
                         .text(format!("{done}/{total}")),
                 );
                 if pointing_hand(ui.button("取消当前任务")).clicked() {
-                    self.library.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.request_library_cancel();
                 }
             });
         }
@@ -80,8 +80,8 @@ impl SepiolaApp {
         ui.separator();
 
         let albums = self.library.index.albums();
-        let reset_counts = self.library.active_task
-            == Some(crate::library::LibraryTask::ReclassifyImages);
+        let reset_counts =
+            self.library.active_task == Some(crate::library::LibraryTask::ReclassifyImages);
         // 内置相册全量展示（含 0 计数），自定义相册追加在后，保证新分类始终可见。
         let mut chips: Vec<(String, usize)> = library::ALL_ALBUMS
             .iter()
@@ -109,12 +109,10 @@ impl SepiolaApp {
                 .iter()
                 .filter(|entry| entry.kind == FileKind::Image)
                 .count();
-            if pointing_hand(ui
-                .selectable_label(
-                    self.library.selected_album.is_none(),
-                    format!("全部（{all_count}）"),
-                )
-            )
+            if pointing_hand(ui.selectable_label(
+                self.library.selected_album.is_none(),
+                format!("全部（{all_count}）"),
+            ))
             .clicked()
             {
                 self.library.selected_album = None;
@@ -122,12 +120,10 @@ impl SepiolaApp {
                 self.library.preview = None;
             }
             for (name, count) in &chips {
-                if pointing_hand(ui
-                    .selectable_label(
-                        self.library.selected_album.as_deref() == Some(name.as_str()),
-                        format!("{name}（{count}）"),
-                    )
-                )
+                if pointing_hand(ui.selectable_label(
+                    self.library.selected_album.as_deref() == Some(name.as_str()),
+                    format!("{name}（{count}）"),
+                ))
                 .clicked()
                 {
                     self.library.selected_album = Some(name.clone());
@@ -171,8 +167,7 @@ impl SepiolaApp {
             );
             let enabled =
                 self.library.selected_rel.is_some() && !self.library.album_draft.trim().is_empty();
-            if pointing_hand(ui.add_enabled(enabled, egui::Button::new("移动/重打标签")))
-                .clicked()
+            if pointing_hand(ui.add_enabled(enabled, egui::Button::new("移动/重打标签"))).clicked()
             {
                 self.retag_selected();
             }
@@ -219,22 +214,23 @@ impl SepiolaApp {
                             .unwrap_or_default(),
                         if entry.manual { " (手动)" } else { "" }
                     );
-                    let selected =
-                        self.library.selected_rel.as_deref() == Some(rel.as_path());
+                    let selected = self.library.selected_rel.as_deref() == Some(rel.as_path());
                     ui.horizontal(|ui| {
                         // 缩略图槽：整行高，等比居中；缺失时占位并投递后台生成任务。
-                        let (slot_rect, slot_resp) =
-                            ui.allocate_exact_size(egui::vec2(ROW_HEIGHT, ROW_HEIGHT), egui::Sense::click());
+                        let (slot_rect, slot_resp) = ui.allocate_exact_size(
+                            egui::vec2(ROW_HEIGHT, ROW_HEIGHT),
+                            egui::Sense::click(),
+                        );
                         let slot_resp = pointing_hand(slot_resp);
                         if kind == FileKind::Image {
                             match self.library.thumb_textures.get(&rel) {
                                 Some(texture) => {
                                     let size = texture.size_vec2();
-                                    let scale = (ROW_HEIGHT / size.x)
-                                        .min(ROW_HEIGHT / size.y)
-                                        .min(1.0);
+                                    let scale =
+                                        (ROW_HEIGHT / size.x).min(ROW_HEIGHT / size.y).min(1.0);
                                     let fitted = size * scale;
-                                    let rect = egui::Rect::from_center_size(slot_rect.center(), fitted);
+                                    let rect =
+                                        egui::Rect::from_center_size(slot_rect.center(), fitted);
                                     ui.put(rect, egui::Image::from_texture((texture.id(), fitted)));
                                 }
                                 None => {
@@ -250,12 +246,18 @@ impl SepiolaApp {
                         if slot_resp.clicked() {
                             self.select_library_file(ui.ctx(), rel.clone(), kind);
                         }
+                        if slot_resp.double_clicked() {
+                            self.open_album_for_visible(ui.ctx(), &visible, pos);
+                        }
                         let resp = pointing_hand(ui.add_sized(
                             [ui.available_width(), ROW_HEIGHT],
                             egui::Button::selectable(selected, label),
                         ));
                         if resp.clicked() {
                             self.select_library_file(ui.ctx(), rel.clone(), kind);
+                        }
+                        if resp.double_clicked() {
+                            self.open_album_for_visible(ui.ctx(), &visible, pos);
                         }
                         let make_menu = |ui: &mut egui::Ui, pending: &mut Option<RowAction>| {
                             row_context_menu(ui, &rel, &draft, &options, pending)
@@ -294,9 +296,14 @@ impl SepiolaApp {
                 });
             }
             None => {
-                ui.weak(
-                    "该文件无可用预览（RAW 请右键选择「显影为 JPEG」，视频/文档不支持内嵌预览）。",
-                );
+                if self.library.preview_loading.is_some() {
+                    ui.spinner();
+                    ui.weak("正在载入预览…");
+                } else {
+                    ui.weak(
+                        "该文件无可用预览（RAW 请右键选择「显影为 JPEG」，视频/文档不支持内嵌预览）。",
+                    );
+                }
             }
         }
     }

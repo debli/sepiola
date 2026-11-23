@@ -46,10 +46,8 @@ impl SepiolaApp {
                     })
                     .show_ui(ui, |ui| {
                         for root in &self.user_settings.recent_library_roots {
-                            if pointing_hand(
-                                ui.selectable_label(root == &self.library.root, root),
-                            )
-                            .clicked()
+                            if pointing_hand(ui.selectable_label(root == &self.library.root, root))
+                                .clicked()
                             {
                                 selected_root = Some(std::path::PathBuf::from(root));
                             }
@@ -57,19 +55,31 @@ impl SepiolaApp {
                     });
                 pointing_hand(response.response);
             }
-            let scan = egui::Button::new(if self.library.scanning { "索引中…" } else { "扫描文件类型" })
-                .min_size(egui::vec2(120.0, 32.0));
+            let scan = egui::Button::new(if self.library.scanning {
+                "索引中…"
+            } else {
+                "扫描文件类型"
+            })
+            .min_size(egui::vec2(120.0, 32.0));
             if pointing_hand(ui.add_enabled(!self.library.scanning, scan)).clicked() {
                 self.start_library_scan();
             }
+            let cancel_requested = self.library.cancel.load(Ordering::Relaxed);
             if self.library.scanning
                 && ui
-                    .button("取消扫描")
+                    .add_enabled(
+                        !cancel_requested,
+                        egui::Button::new(if cancel_requested {
+                            "正在取消…"
+                        } else {
+                            "取消扫描"
+                        }),
+                    )
                     .on_hover_text("未处理的文件留待下次扫描")
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
             {
-                self.library.cancel.store(true, Ordering::Relaxed);
+                self.request_library_cancel();
             }
         });
         if let Some(root) = selected_root {
@@ -77,7 +87,11 @@ impl SepiolaApp {
         }
         if self.library.scanning {
             let (done, total) = self.library.progress;
-            let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+            let fraction = if total == 0 {
+                0.0
+            } else {
+                done as f32 / total as f32
+            };
             ui.add(
                 egui::ProgressBar::new(fraction)
                     .show_percentage()
@@ -91,7 +105,9 @@ impl SepiolaApp {
 
         let counts = self.library.index.kind_counts();
         let total = self.library.index.entries.len();
-        ui.label(format!("共 {total} 个条目；点击类型卡片进入浏览页（当前已实现「图片」「书籍」）。"));
+        ui.label(format!(
+            "共 {total} 个条目；点击类型卡片进入浏览页（当前已实现「图片」「书籍」「音频」「录音」）。"
+        ));
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .id_salt("lib_overview")
@@ -100,13 +116,17 @@ impl SepiolaApp {
                     ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                     for kind in library::ALL_KINDS {
                         let count = counts.get(kind).copied().unwrap_or(0);
-                        let enabled =
-                            matches!(*kind, FileKind::Image | FileKind::Book)
-                                && count > 0
-                                && !self.library.scanning;
+                        let enabled = matches!(
+                            *kind,
+                            FileKind::Image | FileKind::Book | FileKind::Audio | FileKind::Recording
+                        )
+                            && count > 0
+                            && !self.library.scanning;
                         let text = format!("{}\n{} 项", kind.label(), count);
                         let button = egui::Button::new(
-                            egui::RichText::new(text).size(15.0).color(egui::Color32::WHITE),
+                            egui::RichText::new(text)
+                                .size(15.0)
+                                .color(egui::Color32::WHITE),
                         )
                         .fill(kind_accent(*kind))
                         .min_size(egui::vec2(112.0, 76.0));
@@ -125,6 +145,13 @@ impl SepiolaApp {
                                     "先扫描文件类型后再进入"
                                 }
                             }
+                            FileKind::Audio | FileKind::Recording => {
+                                if count > 0 {
+                                    "进入音频元数据库"
+                                } else {
+                                    "先扫描文件类型后再进入"
+                                }
+                            }
                             _ => "浏览页待后续里程碑实现",
                         };
                         if pointing_hand(ui.add_enabled(enabled, button))
@@ -137,8 +164,22 @@ impl SepiolaApp {
                                     LibraryPage::Images
                                 }
                                 FileKind::Book => {
-                                    self.start_book_metadata_scan(false);
+                                    // 元数据已存在（或未尝试过的书为 0）时不再自动扫描，
+                                    // 进入书籍页后可用「提取未处理书籍」手动触发。
+                                    let pending = self.library.index.entries.iter().any(|entry| {
+                                        entry.kind == FileKind::Book
+                                            && !entry.manual
+                                            && entry.book_meta.is_none()
+                                            && !entry.book_metadata_attempted
+                                    });
+                                    if pending {
+                                        self.start_book_metadata_scan(false);
+                                    }
                                     LibraryPage::Books
+                                }
+                                FileKind::Audio | FileKind::Recording => {
+                                    self.start_audio_metadata_scan(false);
+                                    LibraryPage::Music
                                 }
                                 _ => LibraryPage::Overview,
                             };

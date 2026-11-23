@@ -13,6 +13,7 @@ use sepiola::library::{self, LibraryEvent, LibraryIndex, LibraryMessage};
 use crate::book_search::BookSearchState;
 use crate::library_develop::{DevelopEvent, DevelopTask};
 use crate::library_thumbs::ThumbResult;
+use crate::reader::ReaderState;
 use crate::state::{Preview, SepiolaApp};
 
 /// 顶栏页签。
@@ -20,6 +21,9 @@ use crate::state::{Preview, SepiolaApp};
 pub enum Tab {
     Process,
     Library,
+    Notebook,
+    Compare,
+    Settings,
 }
 
 /// 库页内部路由：第一级类型总览 → 各类型浏览页（当前实现图片、书籍）。
@@ -28,6 +32,7 @@ pub enum LibraryPage {
     Overview,
     Images,
     Books,
+    Music,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,6 +41,7 @@ pub enum LibraryTask {
     Images,
     ReclassifyImages,
     Books,
+    AudioMetadata,
 }
 
 /// 库页签的状态与后台扫描线程。
@@ -54,6 +60,10 @@ pub struct LibraryState {
     pub receiver: Option<Receiver<LibraryMessage>>,
     /// 选中文件的预览纹理（仅光栅图；RAW 解码失败时为空）。
     pub preview: Option<Preview>,
+    /// 后台预览像素结果接收端。
+    pub preview_receiver: Option<Receiver<PreviewPixels>>,
+    /// 正在解码的预览路径。
+    pub preview_loading: Option<PathBuf>,
     /// 缩略图任务发送端（持有相对路径）；worker 惰性启动。
     pub thumb_tx: Option<Sender<PathBuf>>,
     /// 缩略图结果接收端。
@@ -74,6 +84,9 @@ pub struct LibraryState {
     pub dev_ok: usize,
     pub dev_fail: usize,
     pub book_search: BookSearchState,
+    pub music_search: String,
+    /// 电子书阅读页状态。
+    pub reader: ReaderState,
 }
 
 impl Default for LibraryState {
@@ -92,6 +105,8 @@ impl Default for LibraryState {
             message: String::new(),
             receiver: None,
             preview: None,
+            preview_receiver: None,
+            preview_loading: None,
             thumb_tx: None,
             thumb_rx: None,
             thumb_requested: HashSet::new(),
@@ -104,8 +119,15 @@ impl Default for LibraryState {
             dev_ok: 0,
             dev_fail: 0,
             book_search: BookSearchState::default(),
+            music_search: String::new(),
+            reader: ReaderState::default(),
         }
     }
+}
+
+pub struct PreviewPixels {
+    pub path: PathBuf,
+    pub result: Result<(usize, usize, Vec<u8>), String>,
 }
 
 /// 库扫描只需要模型路径与阈值，输入/输出目录无关，故从默认配置拼装。
@@ -148,10 +170,20 @@ impl SepiolaApp {
             .book_search
             .refresh_facets(&self.library.index.entries);
         self.library.book_search.reset();
+        self.library.music_search.clear();
         self.library.selected_rel = None;
         self.library.preview = None;
+        self.library.preview_receiver = None;
+        self.library.preview_loading = None;
         self.library.selected_album = None;
+        let merged = self.reader_settings();
         self.library.page = LibraryPage::Overview;
+        self.library.reader = ReaderState {
+            ai: merged.ai.clone(),
+            dictionary: merged.dictionary,
+            ..ReaderState::default()
+        };
+        self.notebook.reload(&root, merged.ai);
         self.reset_thumbs();
         self.reset_develop();
         self.library.message = format!("已载入库 {}", root.display());
@@ -171,6 +203,19 @@ impl SepiolaApp {
 
     pub fn start_book_metadata_scan(&mut self, retry_failed: bool) {
         self.start_library_task(LibraryTask::Books, retry_failed);
+    }
+
+    pub fn start_audio_metadata_scan(&mut self, retry_failed: bool) {
+        self.start_library_task(LibraryTask::AudioMetadata, retry_failed);
+    }
+
+    /// 请求取消当前库任务：立即更新提示，worker 在下一个检查点退出。
+    pub fn request_library_cancel(&mut self) {
+        if !self.library.scanning {
+            return;
+        }
+        self.library.cancel.store(true, Ordering::Relaxed);
+        self.library.message = "正在取消…".to_string();
     }
 
     fn start_library_task(&mut self, task: LibraryTask, retry_failed: bool) {
@@ -195,6 +240,7 @@ impl SepiolaApp {
             LibraryTask::Images => "分类图片…".to_string(),
             LibraryTask::ReclassifyImages => "重新分类图片…".to_string(),
             LibraryTask::Books => "提取书籍元数据…".to_string(),
+            LibraryTask::AudioMetadata => "提取音频元数据…".to_string(),
         };
         let (sender, receiver) = channel();
         self.library.receiver = Some(receiver);
@@ -203,10 +249,10 @@ impl SepiolaApp {
         let cancel = Arc::clone(&self.library.cancel);
         std::thread::spawn(move || {
             let on_event = move |event| {
-                    if let Ok(sender) = hook.lock() {
-                        let _ = sender.send(LibraryMessage::Event(event));
-                    }
-                };
+                if let Ok(sender) = hook.lock() {
+                    let _ = sender.send(LibraryMessage::Event(event));
+                }
+            };
             let result = match task {
                 LibraryTask::Index => library::scan(&root, &config, on_event, &cancel),
                 LibraryTask::Images => {
@@ -217,6 +263,9 @@ impl SepiolaApp {
                 }
                 LibraryTask::Books => {
                     library::extract_book_metadata(&root, retry_failed, on_event, &cancel)
+                }
+                LibraryTask::AudioMetadata => {
+                    library::extract_audio_metadata(&root, retry_failed, on_event, &cancel)
                 }
             }
             .map_err(|error| error.to_string());
@@ -236,15 +285,17 @@ impl SepiolaApp {
                         self.library.progress = (0, total);
                     }
                     Ok(LibraryMessage::Event(LibraryEvent::Processed {
-                        completed,
-                        total,
-                        ..
+                        completed, total, ..
                     })) => {
                         self.library.progress = (completed, total);
                     }
                     Ok(LibraryMessage::Done(result)) => {
                         self.library.scanning = false;
-                        let task = self.library.active_task.take().unwrap_or(LibraryTask::Index);
+                        let task = self
+                            .library
+                            .active_task
+                            .take()
+                            .unwrap_or(LibraryTask::Index);
                         let root = PathBuf::from(self.library.root.trim());
                         self.library.index = LibraryIndex::load(&root).unwrap_or_default();
                         self.library
@@ -253,6 +304,11 @@ impl SepiolaApp {
                         self.library.book_search.reset();
                         self.library.message = match result {
                             Ok(report) => {
+                                let status = if report.cancelled {
+                                    "已取消"
+                                } else {
+                                    "完成"
+                                };
                                 let fallback = if report.detector_missing {
                                     "（人脸模型缺失，未处理图片保持原标签）"
                                 } else {
@@ -260,19 +316,23 @@ impl SepiolaApp {
                                 };
                                 match task {
                                     LibraryTask::Index => format!(
-                                        "类型扫描完成：新增 {}，移除 {}",
+                                        "类型扫描{status}：新增 {}，移除 {}",
                                         report.added, report.removed
                                     ),
                                     LibraryTask::Images => format!(
-                                        "图片分类完成：{} 张{}",
+                                        "图片分类{status}：{} 张{}",
                                         report.classified, fallback
                                     ),
                                     LibraryTask::ReclassifyImages => format!(
-                                        "重新分类完成：{} 张{}",
+                                        "重新分类{status}：{} 张{}",
                                         report.classified, fallback
                                     ),
                                     LibraryTask::Books => format!(
-                                        "书籍元数据处理完成：{} 本",
+                                        "书籍元数据扫描{status}：{} 本",
+                                        report.metadata_attempted
+                                    ),
+                                    LibraryTask::AudioMetadata => format!(
+                                        "音频元数据扫描{status}：{} 个文件",
                                         report.metadata_attempted
                                     ),
                                 }
@@ -297,5 +357,4 @@ impl SepiolaApp {
             self.library.receiver = None;
         }
     }
-
 }

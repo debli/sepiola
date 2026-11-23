@@ -66,9 +66,54 @@ impl ImageF32 {
 ///
 /// 8-bit 数据除以 255，16-bit 数据除以 65535。
 pub fn load(path: &Path) -> Result<ImageF32> {
-    let img = image::open(path)
-        .map_err(|e| Error::Image(format!("failed to open {}: {e}", path.display())))?;
-    Ok(dynamic_to_f32(img))
+    Ok(dynamic_to_f32(load_dynamic(path)?))
+}
+
+/// 读取普通光栅图或由 libheif 解码的 HEIC/HEIF 图像。
+pub fn load_dynamic(path: &Path) -> Result<DynamicImage> {
+    if crate::develop::is_heif_format(path) {
+        return load_heif(path);
+    }
+    image::open(path)
+        .map_err(|e| Error::Image(format!("failed to open {}: {e}", path.display())))
+}
+
+fn load_heif(path: &Path) -> Result<DynamicImage> {
+    use libheif_rs::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+
+    let path_text = path.to_string_lossy();
+    let context = HeifContext::read_from_file(&path_text)
+        .map_err(|error| Error::Image(format!("failed to read HEIC/HEIF {}: {error}", path.display())))?;
+    let handle = context
+        .primary_image_handle()
+        .map_err(|error| Error::Image(format!("failed to find HEIC/HEIF image {}: {error}", path.display())))?;
+    let decoded = LibHeif::new()
+        .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)
+        .map_err(|error| Error::Image(format!("failed to decode HEIC/HEIF {}: {error}", path.display())))?;
+    let plane = decoded
+        .planes()
+        .interleaved
+        .ok_or_else(|| Error::Image(format!("HEIC/HEIF image has no RGB plane: {}", path.display())))?;
+    let row_bytes = plane.width as usize * CHANNELS;
+    if plane.width == 0 || plane.height == 0 {
+        return Err(Error::Image(format!("invalid HEIC/HEIF dimensions: {}", path.display())));
+    }
+    let required = (plane.height as usize - 1)
+        .checked_mul(plane.stride)
+        .and_then(|offset| offset.checked_add(row_bytes))
+        .ok_or_else(|| Error::Image(format!("invalid HEIC/HEIF dimensions: {}", path.display())))?;
+    if plane.stride < row_bytes || plane.data.len() < required {
+        return Err(Error::Image(format!("invalid HEIC/HEIF RGB plane: {}", path.display())));
+    }
+    let rgb = ImageBuffer::from_fn(plane.width, plane.height, |x, y| {
+        let offset = y as usize * plane.stride + x as usize * CHANNELS;
+        Rgb([
+            plane.data[offset],
+            plane.data[offset + 1],
+            plane.data[offset + 2],
+        ])
+    });
+    Ok(DynamicImage::ImageRgb8(rgb))
 }
 
 /// 按指定质量保存为 JPEG。

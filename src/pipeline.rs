@@ -64,7 +64,7 @@ pub struct SingleResult {
 }
 
 /// 支持的通用图片扩展名；RAW 扩展名由 `develop::is_raw_format` 判断。
-const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "tif", "tiff", "png"];
+const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "tif", "tiff", "png", "heic", "heif"];
 
 fn is_supported(path: &Path) -> bool {
     develop::is_raw_format(path)
@@ -524,7 +524,14 @@ mod tests {
                 ..crate::config::IdentitySettings::default()
             },
             scene_tags: crate::config::SceneTagSettings::default(),
+            reader: crate::config::ReaderSettings::default(),
         }
+    }
+
+    #[test]
+    fn heif_images_are_supported_case_insensitively() {
+        assert!(is_supported(Path::new("photo.heic")));
+        assert!(is_supported(Path::new("photo.HEIF")));
     }
 
     #[test]
