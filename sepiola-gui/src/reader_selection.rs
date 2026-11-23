@@ -305,6 +305,8 @@ impl SepiolaApp {
             .clear_selection();
         self.library.reader.selection = None;
         self.library.reader.toolbar_rect = None;
+        // 位图页面上的自定义文字选区也要一起清掉。
+        self.library.reader.pdf_select = None;
     }
 
     fn start_assist(&mut self, kind: AssistKind, text: String) {

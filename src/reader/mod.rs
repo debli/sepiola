@@ -1,12 +1,13 @@
 //! 电子书阅读解析层（M44）：EPUB / MOBI / AZW3 / TXT / PDF → 章节文本与样式区间。
 //!
-//! 解析全部使用纯 Rust 库，不调用 calibre、pdftotext 等外部程序；加密书籍、
-//! 扫描版 PDF 等无法取出正文的情况返回带原因的错误，由界面提示。
+//! 除 PDF 优先复用系统的 `mutool` 外，其余解析全部使用纯 Rust 库，
+//! 不调用 calibre、pdftotext 等外部程序；加密书籍、扫描版 PDF 等
+//! 无法取出正文的情况返回带原因的错误，由界面提示。
 
 mod epub;
 mod markup;
 mod mobi;
-mod pdf;
+pub mod pdf;
 mod text;
 
 pub mod assist;
@@ -105,6 +106,8 @@ pub struct BookDocument {
     pub title: Option<String>,
     pub author: Option<String>,
     pub chapters: Vec<Chapter>,
+    /// PDF 文档：界面用页面渲染模式显示，文本层仅供 AI 分析。
+    pub is_pdf: bool,
 }
 
 impl BookDocument {
@@ -140,7 +143,16 @@ impl BookDocument {
             "pdf" => pdf::parse(path)?,
             _ => return Err(format!("不支持的电子书格式：.{ext}")),
         };
-        if document.chapters.iter().all(|chapter| chapter.text.trim().is_empty()) {
+        if document.chapters.is_empty() {
+            return Err("未解析到正文（可能是加密书籍或损坏文件）".to_string());
+        }
+        // PDF 页面渲染模式允许正文全空（扫描版逐页显示位图）。
+        if !document.is_pdf
+            && document
+                .chapters
+                .iter()
+                .all(|chapter| chapter.text.trim().is_empty())
+        {
             return Err("未解析到正文（可能是加密书籍或纯图片扫描版）".to_string());
         }
         Ok(document)
@@ -260,6 +272,10 @@ fn default_paragraph_spacing() -> f32 {
     0.0
 }
 
+fn default_pdf_dpi() -> u32 {
+    crate::reader::pdf::DEFAULT_DPI
+}
+
 /// 每本书的阅读位置（章节序号与上次阅读时间）。
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReadingPosition {
@@ -369,6 +385,12 @@ pub struct ReadingState {
     /// 自定义文字颜色（RGB），空表示跟随主题。
     #[serde(default)]
     pub text_color: Option<[u8; 3]>,
+    /// PDF 页面渲染分辨率（缩放）；其它格式忽略。
+    #[serde(default = "default_pdf_dpi")]
+    pub pdf_dpi: u32,
+    /// PDF 是否改用文本重排（关闭时按页渲染，保留原始版面且文字可选中）。
+    #[serde(default)]
+    pub pdf_text_mode: bool,
     #[serde(default)]
     pub positions: BTreeMap<String, ReadingPosition>,
 }
@@ -385,6 +407,8 @@ impl Default for ReadingState {
             paragraph_spacing: default_paragraph_spacing(),
             background: None,
             text_color: None,
+            pdf_dpi: default_pdf_dpi(),
+            pdf_text_mode: false,
             positions: BTreeMap::new(),
         }
     }
@@ -443,6 +467,15 @@ impl ReadingState {
             self.paragraph_spacing
         } else {
             default_paragraph_spacing()
+        }
+    }
+
+    /// PDF 渲染分辨率（越界时回退默认值）。
+    pub fn readable_pdf_dpi(&self) -> u32 {
+        if (60..=300).contains(&self.pdf_dpi) {
+            self.pdf_dpi
+        } else {
+            crate::reader::pdf::DEFAULT_DPI
         }
     }
 

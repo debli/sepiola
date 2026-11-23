@@ -28,6 +28,7 @@ pub fn parse_file(path: &Path) -> Result<BookDocument, String> {
         title,
         author: None,
         chapters: split_chapters(&text),
+        is_pdf: false,
     })
 }
 

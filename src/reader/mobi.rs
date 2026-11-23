@@ -25,5 +25,6 @@ pub fn parse(path: &Path) -> Result<BookDocument, String> {
         title: (!title.trim().is_empty()).then_some(title),
         author: book.author(),
         chapters: text::split_chapters(&content),
+        is_pdf: false,
     })
 }

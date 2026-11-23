@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -125,7 +125,8 @@ pub struct ReaderState {
     pub chapter: usize,
     pub loading: bool,
     pub error: Option<String>,
-    pub receiver: Option<Receiver<Result<BookDocument, String>>>,
+    /// 解析结果，附带 PDF 的页面点尺寸（其它格式为 `None`）。
+    pub receiver: Option<Receiver<Result<(BookDocument, Option<(f32, f32)>), String>>>,
     pub font_size: f32,
     pub theme: ReaderTheme,
     pub font: ReaderFont,
@@ -227,6 +228,52 @@ pub struct ReaderState {
     pub dictionary: ReaderDictionarySettings,
     pub notice: String,
     pub notice_until: Option<Instant>,
+    /// PDF 页面渲染：书籍绝对路径（渲染工作线程在打开时启动）。
+    pub pdf_path: Option<PathBuf>,
+    /// PDF 渲染分辨率（按屏幕像素自适应）。
+    pub pdf_dpi: u32,
+    /// 已渲染页的 PNG 数据（`None` 表示该页渲染失败，不再重试）。
+    pub pdf_pages: HashMap<usize, Option<Arc<Vec<u8>>>>,
+    /// 各页像素尺寸（渲染成功后填充），用于计算显示尺寸。
+    pub pdf_sizes: HashMap<usize, (u32, u32)>,
+    /// 已发出渲染请求、尚未返回的页。
+    pub pdf_pending: BTreeSet<usize>,
+    /// 渲染请求通道（每本 PDF 一个后台工作线程）：(页, dpi, 是否需要文字层)。
+    pub pdf_sender: Option<Sender<(usize, u32, bool)>>,
+    /// 渲染结果通道。
+    pub pdf_receiver: Option<Receiver<Result<PdfPageRender, (usize, String)>>>,
+    /// 首个成功页学到的宽高比（宽/高），未渲染页占位时按它估算高度。
+    pub pdf_aspect: Option<f32>,
+    /// 页面尺寸（点，1/72 英寸），由首次渲染反推；用于按屏幕像素算渲染分辨率。
+    pub pdf_page_pt: Option<(f32, f32)>,
+    /// PDF 是否带文本层（扫描版为 false，只能页面渲染）。
+    pub pdf_has_text: bool,
+    /// 文本版 PDF 是否使用文本重排（默认关闭：按页渲染，保留版面且文字可选中）。
+    pub pdf_text_mode: bool,
+    /// 每页的文字层版面（字符矩形），用于在位图上做文字选区。
+    pub pdf_text: HashMap<usize, Option<Arc<sepiola::reader::pdf::PdfTextPage>>>,
+    /// 位图页面上的文字选区（字符序号区间）。
+    pub pdf_select: Option<PdfSelect>,
+}
+
+/// 后台渲染完成的一页：PNG 与像素尺寸，附带该页文字层版面（与 dpi 无关）。
+pub struct PdfPageRender {
+    pub page: usize,
+    pub dpi: u32,
+    pub width: u32,
+    pub height: u32,
+    pub png: Vec<u8>,
+    pub text: Option<sepiola::reader::pdf::PdfTextPage>,
+}
+
+/// 位图页面上的一次文字选区：起点与当前点都按「拼平字符序号」记录。
+#[derive(Clone, Copy, Debug)]
+pub struct PdfSelect {
+    pub page: usize,
+    pub anchor: usize,
+    pub cursor: usize,
+    /// 是否处于拖动中；双击选词时为 false，按住不动不会把选区缩成一个字符。
+    pub dragging: bool,
 }
 
 impl Default for ReaderState {
@@ -298,7 +345,43 @@ impl Default for ReaderState {
             dictionary: ReaderDictionarySettings::default(),
             notice: String::new(),
             notice_until: None,
+            pdf_path: None,
+            pdf_dpi: sepiola::reader::pdf::DEFAULT_DPI,
+            pdf_pages: HashMap::new(),
+            pdf_sizes: HashMap::new(),
+            pdf_pending: BTreeSet::new(),
+            pdf_sender: None,
+            pdf_receiver: None,
+            pdf_aspect: None,
+            pdf_page_pt: None,
+            pdf_has_text: false,
+            pdf_text_mode: false,
+            pdf_text: HashMap::new(),
+            pdf_select: None,
         }
+    }
+}
+
+impl ReaderState {
+    /// 调整 PDF 渲染分辨率：清掉旧 dpi 的页面数据与纹理，触发重新渲染。
+    /// 页面尺寸（点）与 dpi 无关，保留下来供下一次自适应计算。
+    pub fn set_pdf_dpi(&mut self, dpi: u32) {
+        let dpi = dpi.clamp(72, 300);
+        if dpi == self.pdf_dpi {
+            return;
+        }
+        self.pdf_dpi = dpi;
+        self.pdf_pages.clear();
+        self.pdf_sizes.clear();
+        self.pdf_pending.clear();
+        // 宽高比与页面点尺寸和 dpi 无关，版面高度也不变，无需清空。
+        self.image_textures.clear();
+    }
+
+    /// 是否用页面位图显示：默认所有 PDF 都按页渲染（保留版面、文字可选中）；
+    /// 带文本层的 PDF 可以切到文本重排（可调字号，但失去版式）。
+    pub fn pdf_page_mode(&self) -> bool {
+        self.pdf_path.is_some() && !(self.pdf_text_mode && self.pdf_has_text)
     }
 }
 
@@ -336,9 +419,30 @@ impl SepiolaApp {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| rel.display().to_string());
         let (sender, receiver) = channel();
+        let open_path = path.clone();
+        // PDF 的页面尺寸在解析线程里顺手读出来：首帧就按真实宽高比排版，
+        // 避免第一页渲染完成时版面跳动导致阅读位置漂移。
+        let is_pdf = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
         std::thread::spawn(move || {
-            let _ = sender.send(BookDocument::open(&path));
+            let size = if is_pdf {
+                sepiola::reader::pdf::page_size(&open_path)
+            } else {
+                None
+            };
+            let _ = sender.send(BookDocument::open(&open_path).map(|document| (document, size)));
         });
+        // PDF 走页面渲染模式：起一个后台工作线程，按需渲染单页 PNG。
+        let pdf_cache_dir = root
+            .join(sepiola::library::LIBRARY_DIR)
+            .join("pdf_render");
+        let (pdf_sender, pdf_receiver) = if is_pdf {
+            Self::spawn_pdf_worker(path.clone(), pdf_cache_dir.clone())
+        } else {
+            (None, None)
+        };
         let settings = self.reader_settings();
         // 打开书时读取该书已缓存的分析结果；正文变化后按指纹逐章失效。
         let book_analysis = analysis_store::load(&root, &rel);
@@ -371,6 +475,11 @@ impl SepiolaApp {
             stream_generation: self.library.reader.stream_generation.wrapping_add(1),
             ai: settings.ai,
             dictionary: settings.dictionary,
+            pdf_path: is_pdf.then(|| path.clone()),
+            pdf_dpi: reading.readable_pdf_dpi(),
+            pdf_text_mode: reading.pdf_text_mode,
+            pdf_sender,
+            pdf_receiver,
             ..ReaderState::default()
         };
         self.library.message = "正在解析书籍…".to_string();
@@ -379,7 +488,111 @@ impl SepiolaApp {
         self.save_reader_position();
     }
 
+    /// PDF 页面渲染工作线程：串行处理渲染请求，避免并发拉起多个 mutool。
+    fn spawn_pdf_worker(
+        path: PathBuf,
+        cache_dir: PathBuf,
+    ) -> (
+        Option<Sender<(usize, u32, bool)>>,
+        Option<Receiver<Result<PdfPageRender, (usize, String)>>>,
+    ) {
+        let (req_tx, req_rx) = channel::<(usize, u32, bool)>();
+        let (res_tx, res_rx) = channel();
+        std::thread::spawn(move || {
+            // Sender 被丢弃（换书）后循环退出。
+            while let Ok((page, dpi, need_text)) = req_rx.recv() {
+                let result = match sepiola::reader::pdf::render_page_png(
+                    &path, page, dpi, &cache_dir,
+                ) {
+                    Ok(bytes) => match Self::png_dims(&bytes) {
+                        Some((width, height)) => {
+                            // 文字层与 dpi 无关；只在缺的时候取一次。
+                            let text = need_text
+                                .then(|| sepiola::reader::pdf::page_text_layout(&path, page).ok())
+                                .flatten();
+                            Ok(PdfPageRender {
+                                page,
+                                dpi,
+                                width,
+                                height,
+                                png: bytes,
+                                text,
+                            })
+                        }
+                        None => Err((page, "页面图片尺寸读取失败".to_string())),
+                    },
+                    Err(error) => Err((page, error)),
+                };
+                if res_tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        (Some(req_tx), Some(res_rx))
+    }
+
+    /// 读取 PNG 头部得到像素尺寸，不做完整解码。
+    fn png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+        image::io::Reader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()
+    }
+
+    /// 收取后台渲染完成的页面；换 dpi 后到达的过期结果直接丢弃。
+    pub fn poll_pdf_pages(&mut self) {
+        // 先取出接收端，处理完再放回，避免与状态可变借用冲突。
+        let Some(receiver) = self.library.reader.pdf_receiver.take() else {
+            return;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok(Ok(rendered)) => {
+                    let PdfPageRender {
+                        page,
+                        dpi,
+                        width,
+                        height,
+                        png,
+                        text,
+                    } = rendered;
+                    let reader = &mut self.library.reader;
+                    // 先清 pending，再判断是否过期：否则换 dpi 后旧结果被丢弃时
+                    // pending 会永远留着，这一页就再也不会重新渲染。
+                    let pending = reader.pdf_pending.remove(&page);
+                    if dpi != reader.pdf_dpi || !pending {
+                        continue;
+                    }
+                    // 每页都记下文字层结果：`None` 表示该页没有文字层，
+                    // 避免每帧重复去取同一页。
+                    reader.pdf_text.insert(page, text.map(Arc::new));
+                    if reader.pdf_aspect.is_none() && width > 0 && height > 0 {
+                        reader.pdf_aspect = Some(width as f32 / height as f32);
+                    }
+                    // 像素尺寸 ÷ dpi × 72 = 页面点尺寸；只学一次。
+                    if reader.pdf_page_pt.is_none() && dpi > 0 && width > 0 && height > 0 {
+                        let scale = 72.0 / dpi as f32;
+                        reader.pdf_page_pt =
+                            Some((width as f32 * scale, height as f32 * scale));
+                    }
+                    reader.pdf_sizes.insert(page, (width, height));
+                    reader.pdf_pages.insert(page, Some(Arc::new(png)));
+                }
+                Ok(Err((page, _error))) => {
+                    let reader = &mut self.library.reader;
+                    reader.pdf_pending.remove(&page);
+                    // 标记失败，避免每帧重试。
+                    reader.pdf_pages.entry(page).or_insert(None);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        self.library.reader.pdf_receiver = Some(receiver);
+    }
+
     pub fn poll_reader(&mut self) {
+        self.poll_pdf_pages();
         self.poll_assist();
         self.poll_analysis();
         self.poll_analysis_cards();
@@ -398,12 +611,24 @@ impl SepiolaApp {
         self.library.reader.receiver = None;
         self.library.reader.loading = false;
         match result {
-            Ok(document) => {
+            Ok((document, page_size)) => {
                 let chapter = self
                     .library
                     .reader
                     .chapter
                     .min(document.chapters.len().saturating_sub(1));
+                // PDF 是否带文本层：有文本时优先文本模式（可选中、可 AI 分析），
+                // 扫描版只能页面渲染。
+                if document.is_pdf {
+                    self.library.reader.pdf_has_text = document
+                        .chapters
+                        .iter()
+                        .any(|chapter| !chapter.text.trim().is_empty());
+                    if let Some((width, height)) = page_size.filter(|(w, h)| *w > 0.0 && *h > 0.0) {
+                        self.library.reader.pdf_page_pt = Some((width, height));
+                        self.library.reader.pdf_aspect = Some(width / height);
+                    }
+                }
                 if let Some(title) = document.title.clone().filter(|title| !title.trim().is_empty()) {
                     self.library.reader.title = title;
                 }
@@ -1558,6 +1783,8 @@ impl SepiolaApp {
         state.paragraph_spacing = self.library.reader.paragraph_spacing;
         state.background = self.library.reader.background;
         state.text_color = self.library.reader.text_color;
+        state.pdf_dpi = self.library.reader.pdf_dpi;
+        state.pdf_text_mode = self.library.reader.pdf_text_mode;
         let chapter = self.library.reader.chapter;
         let title = self
             .library

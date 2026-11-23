@@ -100,6 +100,7 @@ pub fn parse(path: &Path) -> Result<BookDocument, String> {
             .or_else(|| path.file_stem().map(|stem| stem.to_string_lossy().into_owned())),
         author: package.author,
         chapters,
+        is_pdf: false,
     })
 }
 

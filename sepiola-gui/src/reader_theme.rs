@@ -348,6 +348,35 @@ impl SepiolaApp {
                         }
                         ui.end_row();
 
+                        // PDF：扫描版只能逐页渲染；带文本层时可以在「文本模式
+                        // （可选中、可 AI 分析）」与「页面渲染（保留原始版面）」间切换。
+                        if self
+                            .library
+                            .reader
+                            .document
+                            .as_ref()
+                            .is_some_and(|document| document.is_pdf)
+                        {
+                            ui.label("PDF 显示");
+                            if self.library.reader.pdf_has_text {
+                                if ui
+                                    .checkbox(
+                                        &mut self.library.reader.pdf_text_mode,
+                                        "文本模式（重排文字、可调字号，失去原始版式）",
+                                    )
+                                    .changed()
+                                {
+                                    self.library.reader.image_textures.clear();
+                                    self.library.reader.chapter_heights.clear();
+                                    self.library.reader.pdf_select = None;
+                                    changed = true;
+                                }
+                            } else {
+                                ui.weak("扫描版：逐页位图（按屏幕分辨率超采样渲染）");
+                            }
+                            ui.end_row();
+                        }
+
                         ui.label("行间距");
                         let mut line_spacing = self.library.reader.line_spacing;
                         if ui

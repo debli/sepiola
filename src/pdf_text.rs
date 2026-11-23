@@ -1,5 +1,10 @@
 //! PDF 文本层提取。
 //!
+//! 优先调用系统安装的 `mutool draw -F text`：对 CJK CMap（GBK-EUC-H 等）、
+//! 粗体阴影重绘、非 Identity-H 编码等真实世界 PDF 远比纯 Rust 的
+//! `pdf-extract` 可靠，输出也更快更干净。mutool 未安装或调用失败时，
+//! 回退到 `pdf-extract`。
+//!
 //! `pdf-extract` 遇到非标准字形名（常见于内嵌 Dingbats 子集字体）时会直接
 //! `println!` 一行告警，一本大书能刷出几十万行。终端打印本身非常耗 CPU，
 //! 所以解析期间临时把 stdout 指向 `/dev/null`，结束后恢复。
@@ -79,13 +84,41 @@ pub fn extract_cached(path: &Path, max_bytes: u64) -> Result<String, String> {
     if len > max_bytes {
         return Err(format!("PDF 超过 {}MB，暂不支持", max_bytes / 1024 / 1024));
     }
-    let bytes = std::fs::read(path).map_err(|error| format!("读取 {} 失败：{error}", path.display()))?;
-    let text = extract(&bytes)?;
+    let text = extract_from_path(path)?;
     cache_put(key, text.clone());
     Ok(text)
 }
 
-/// 提取 PDF 文本层；解析期间不输出第三方库的调试信息。
+/// 提取 PDF 文本层：优先 mutool；mutool 未安装或调用失败时回退 pdf-extract。
+pub fn extract_from_path(path: &Path) -> Result<String, String> {
+    match extract_with_mutool(path) {
+        Ok(text) => Ok(text),
+        Err(_) => {
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("读取 {} 失败：{error}", path.display()))?;
+            extract(&bytes)
+        }
+    }
+}
+
+/// 用系统 `mutool draw -F text` 提取文本层。
+/// mutool 成功执行但输出为空说明没有文本层（扫描版），直接返回空串，
+/// 让上层给出准确的「无文本层」提示，而不是回退到可能 panic 的 pdf-extract。
+fn extract_with_mutool(path: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("mutool")
+        .args(["draw", "-F", "text", "-q"])
+        .arg(path)
+        .output()
+        .map_err(|error| format!("mutool 不可用：{error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let reason = stderr.lines().next().unwrap_or("未知错误");
+        return Err(format!("mutool 提取失败：{reason}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 提取 PDF 文本层（pdf-extract 回退路径）；解析期间不输出第三方库的调试信息。
 pub fn extract(bytes: &[u8]) -> Result<String, String> {
     let _guard = STDOUT_LOCK
         .lock()
@@ -155,6 +188,23 @@ mod tests {
         let bytes = crate::book::build_test_pdf(&["Hello quiet"]);
         let text = extract(&bytes).expect("pdf text");
         assert!(text.contains("Hello quiet"));
+    }
+
+    #[test]
+    fn extract_from_path_prefers_mutool_and_falls_back() {
+        let dir = std::env::temp_dir().join(format!(
+            "sepiola-pdf-path-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("book.pdf");
+        std::fs::write(&path, crate::book::build_test_pdf(&["Hello mutool"])).expect("write");
+        let text = extract_from_path(&path).expect("extract");
+        assert!(text.contains("Hello mutool"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

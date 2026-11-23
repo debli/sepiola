@@ -554,6 +554,7 @@ mod tests {
         BookDocument {
             title: None,
             author: None,
+            is_pdf: false,
             chapters: vec![Chapter {
                 title: "One".to_string(),
                 text: text.to_string(),
