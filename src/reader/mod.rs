@@ -472,7 +472,7 @@ impl ReadingState {
 
     /// PDF 渲染分辨率（越界时回退默认值）。
     pub fn readable_pdf_dpi(&self) -> u32 {
-        if (60..=300).contains(&self.pdf_dpi) {
+        if (60..=480).contains(&self.pdf_dpi) {
             self.pdf_dpi
         } else {
             crate::reader::pdf::DEFAULT_DPI

@@ -5,6 +5,7 @@
 //! （扫描书、图表、公式都能正常显示）。文本无法对齐页数时退回段落分块。
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
@@ -61,11 +62,17 @@ fn page_chapters(text: &str, pages: usize) -> Vec<Chapter> {
         .collect()
 }
 
-/// 读取首页的页面尺寸（点），来自 `mutool info` 的 Mediaboxes 段落。
-/// 用于首帧按真实宽高比排版，避免第一页渲染完成时版面跳动。
+/// 读取 PDF 的正文页面尺寸（点），用于首帧排版和渲染分辨率计算。
+///
+/// 不能直接用首页或 `mutool info` 的 MediaBox：
+/// - 封面、插图页的尺寸常与正文不同；
+/// - 很多书设置了 CropBox（实际显示区域），比 MediaBox 小。
+///
+/// 这里用 `mutool pages` 取每页的 CropBox（缺失时用 MediaBox），按页数最多的
+/// 尺寸作为整本书的代表尺寸，并处理 `/Rotate` 带来的宽高互换。
 pub fn page_size(path: &Path) -> Option<(f32, f32)> {
     let output = std::process::Command::new("mutool")
-        .arg("info")
+        .arg("pages")
         .arg(path)
         .output()
         .ok()?;
@@ -73,34 +80,69 @@ pub fn page_size(path: &Path) -> Option<(f32, f32)> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut in_boxes = false;
+    let mut counts: HashMap<(i64, i64), (usize, f32, f32)> = HashMap::new();
+    let mut media = None;
+    let mut crop = None;
+    let mut rotate = 0;
     for line in stdout.lines() {
-        if line.trim_start().starts_with("Mediaboxes") {
-            in_boxes = true;
-            continue;
-        }
-        if !in_boxes {
-            continue;
-        }
-        let Some(open) = line.find('[') else {
-            break;
-        };
-        let Some(close) = line[open..].find(']') else {
-            continue;
-        };
-        let numbers: Vec<f32> = line[open + 1..open + close]
-            .split_whitespace()
-            .filter_map(|value| value.parse().ok())
-            .collect();
-        if numbers.len() == 4 {
-            let width = (numbers[2] - numbers[0]).abs();
-            let height = (numbers[3] - numbers[1]).abs();
-            if width > 0.0 && height > 0.0 {
-                return Some((width, height));
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("<MediaBox") {
+            media = parse_box(rest);
+        } else if let Some(rest) = line.strip_prefix("<CropBox") {
+            crop = parse_box(rest);
+        } else if let Some(rest) = line.strip_prefix("<Rotate") {
+            rotate = parse_rotate(rest).unwrap_or(0);
+        } else if line.starts_with("</page>") {
+            let mut size = crop.or(media);
+            if rotate.rem_euclid(180) == 90 {
+                size = size.map(|(width, height)| (height, width));
             }
+            if let Some((width, height)) = size {
+                let key = (width.round() as i64, height.round() as i64);
+                let entry = counts.entry(key).or_insert((0, width, height));
+                entry.0 += 1;
+            }
+            media = None;
+            crop = None;
+            rotate = 0;
         }
     }
-    None
+    counts
+        .into_iter()
+        .max_by_key(|(_, (pages, _, _))| *pages)
+        .map(|(_, (_, width, height))| (width, height))
+}
+
+/// 解析 `<MediaBox l="0" b="0" r="612" t="792" />` 这类行，返回宽高。
+fn parse_box(text: &str) -> Option<(f32, f32)> {
+    let (mut l, mut b, mut r, mut t) = (None, None, None, None);
+    for part in text.split_whitespace() {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let parsed: f32 = value.trim_matches('"').parse().ok()?;
+        match key {
+            "l" => l = Some(parsed),
+            "b" => b = Some(parsed),
+            "r" => r = Some(parsed),
+            "t" => t = Some(parsed),
+            _ => {}
+        }
+    }
+    let width = (r? - l?).abs();
+    let height = (t? - b?).abs();
+    (width > 0.0 && height > 0.0).then_some((width, height))
+}
+
+/// 解析 `<Rotate v="90" />`，返回归一化到 0/90/180/270 的角度。
+fn parse_rotate(text: &str) -> Option<i32> {
+    let value = text.split("v=").nth(1)?;
+    let angle: i32 = value
+        .split(|c: char| !c.is_ascii_digit() && c != '-')
+        .next()?
+        .parse()
+        .ok()?;
+    Some(angle.rem_euclid(360))
 }
 
 /// 用 `mutool info` 读取 PDF 总页数。

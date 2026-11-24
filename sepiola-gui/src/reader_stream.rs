@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui;
+use egui::emath::GuiRounding;
 use sepiola::reader::analysis_store::{self, BookAnalysis};
 use sepiola::reader::analyze::{Annotation, AnnotationKind};
 use sepiola::reader::highlight::Highlight;
@@ -176,9 +177,7 @@ fn styled_job(
                     let [r, g, b] = highlight.color;
                     egui::Color32::from_rgba_unmultiplied(r, g, b, 110)
                 })
-                .or_else(|| {
-                    annotation.map(|annotation| annotation_fill(annotation.kind))
-                })
+                .or_else(|| annotation.map(|annotation| annotation_fill(annotation.kind)))
                 .unwrap_or(egui::Color32::TRANSPARENT),
             line_height: Some((base_line + bonus) * spacing),
             // 没有斜体字面时用倾斜合成。
@@ -226,9 +225,9 @@ fn annotation_at_byte<'a>(
     chapter: usize,
     byte: usize,
 ) -> Option<&'a Annotation> {
-    annotations
-        .iter()
-        .find(|annotation| annotation.chapter == chapter && annotation.start <= byte && byte < annotation.end)
+    annotations.iter().find(|annotation| {
+        annotation.chapter == chapter && annotation.start <= byte && byte < annotation.end
+    })
 }
 
 /// 某章已缓存的彩标；正文指纹不一致（已改动）时视为没有缓存。
@@ -266,9 +265,8 @@ fn measure_chapter_height(
     let text_color = ui.visuals().text_color();
     let spacing = line_spacing.max(0.5);
     let font_id = egui::FontId::new(font_size, family.clone());
-    let line_height = (ui.fonts_mut(|f| f.row_height(&font_id))
-        + ui.spacing().extra_text_line_spacing)
-        * spacing;
+    let line_height =
+        (ui.fonts_mut(|f| f.row_height(&font_id)) + ui.spacing().extra_text_line_spacing) * spacing;
     let item_spacing = ui.spacing().item_spacing.y;
     // `TextEdit` 分配的高度不低于 `interact_size.y`（单行短文本会被抬高到该高度）。
     let interact_height = ui.spacing().interact_size.y;
@@ -302,19 +300,14 @@ fn measure_chapter_height(
                     width,
                 );
                 // 段间距通过下移 galley 行实现，保持单一 TextEdit，可跨段落选择。
-                let galley = with_paragraph_spacing(
-                    ui.fonts_mut(|f| f.layout_job(job)),
-                    paragraph_spacing,
-                );
+                let galley =
+                    with_paragraph_spacing(ui.fonts_mut(|f| f.layout_job(job)), paragraph_spacing);
                 let text_height = galley.size().y.max(line_height).max(interact_height);
                 body_height += text_height + item_spacing;
-                last_line = galley.rows.last().map(|row| {
-                    (
-                        row.pos.x + row.row.size.x,
-                        row.pos.y,
-                        text_height,
-                    )
-                });
+                last_line = galley
+                    .rows
+                    .last()
+                    .map(|row| (row.pos.x + row.row.size.x, row.pos.y, text_height));
             }
             ChapterItem::Image(index) => {
                 let index = *index;
@@ -574,7 +567,7 @@ fn image_texture(
     texture
 }
 
-/// PDF 页位图的纹理：超采样渲染后需要缩小显示，用 mipmap 过滤避免细笔画摩尔纹。
+/// PDF 页位图的纹理：按屏幕物理像素 1:1 渲染，放大缩小时都保持像素边缘清晰。
 fn pdf_page_texture(
     textures: &mut HashMap<(usize, usize), Option<egui::TextureHandle>>,
     ctx: &egui::Context,
@@ -582,9 +575,9 @@ fn pdf_page_texture(
     data: &std::sync::Arc<Vec<u8>>,
 ) -> Option<egui::TextureHandle> {
     let options = egui::TextureOptions {
-        magnification: egui::TextureFilter::Linear,
-        minification: egui::TextureFilter::Linear,
-        mipmap_mode: Some(egui::TextureFilter::Linear),
+        magnification: egui::TextureFilter::Nearest,
+        minification: egui::TextureFilter::Nearest,
+        mipmap_mode: None,
         ..Default::default()
     };
     if let Some(cached) = textures.get(&(page, 0)) {
@@ -615,20 +608,20 @@ fn decode_texture(
     let rgba = decoded.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-    Some(ctx.load_texture(
-        format!("reader_image_{chapter}_{index}"),
-        color,
-        options,
-    ))
+    Some(ctx.load_texture(format!("reader_image_{chapter}_{index}"), color, options))
 }
 
 /// 单张插图解码后的最大宽度（像素）。
 const MAX_TEXTURE_WIDTH: u32 = 1600;
-/// PDF 页纹理的最大宽度：按屏幕像素超采样后原样贴图，限制上限以控制显存。
-const PDF_TEXTURE_MAX_WIDTH: u32 = 2600;
-/// 渲染分辨率相对屏幕像素的超采样倍数：贴图缩放时字符边缘不会被线性过滤糊掉。
-/// 不宜过大：超过 2 倍会落到更粗的 mip 层，反而更软。
-const PDF_OVERSAMPLE: f32 = 1.5;
+/// PDF 页纹理的最大宽度：按屏幕物理像素 1:1 渲染，限制上限以控制显存。
+const PDF_TEXTURE_MAX_WIDTH: u32 = 4096;
+
+/// 按页面实际点尺寸和屏幕物理像素计算清晰渲染 dpi。
+fn adaptive_pdf_dpi(width: f32, pixels_per_point: f32, page_pt_width: f32) -> u32 {
+    let needed = width * pixels_per_point / (page_pt_width / 72.0);
+    let texture_cap = PDF_TEXTURE_MAX_WIDTH as f32 * 72.0 / page_pt_width;
+    needed.min(texture_cap).clamp(96.0, 480.0).ceil() as u32
+}
 
 /// PDF 页面渲染窗口外保留的页数（纹理与 PNG 数据）。
 const PDF_KEEP: usize = 2;
@@ -656,6 +649,7 @@ fn pdf_page_block(
     select: &mut Option<PdfSelect>,
     found: &mut Option<Selection>,
     deselected: &mut bool,
+    block: Option<egui::Rect>,
 ) -> ChapterRender {
     let width = ui.available_width();
     let aspect = pdf.aspect.max(0.2);
@@ -670,8 +664,17 @@ fn pdf_page_block(
                 aspect
             };
             let size = egui::Vec2::new(width, width / aspect.max(0.2));
-            let response = ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
-            page_rect = Some(response.rect);
+            let (allocated, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            // 位图对齐到物理像素网格：滚动偏移通常是小数，贴在非整数像素上时
+            // 整页会被线性过滤重采样，文字看起来发虚。
+            let rect = allocated.round_to_pixels(ui.ctx().pixels_per_point());
+            ui.painter().image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            page_rect = Some(rect);
         }
     }
     let Some(rect) = page_rect else {
@@ -702,20 +705,85 @@ fn pdf_page_block(
     let mut clicked = false;
     if let Some(page) = text {
         if !page.lines.is_empty() && page.width > 0.0 {
-            // 把指针位置换算成「拼平字符序号」；拼平顺序是逐行文字 + 换行。
-            // 离最近的文字行太远（点在页边/段落空白处）时返回 `None`：
-            // 空白处不算命中任何字符，避免点空白却选中最近的文字。
-            let to_flat = |pos: egui::Pos2| -> Option<usize> {
+            // 把指针位置换算成页面坐标（pt）。
+            let page_pos = |pos: egui::Pos2| -> (f32, f32) {
                 let scale = rect.width() / page.width.max(1.0);
-                let px = ((pos.x - rect.left()) / scale).clamp(0.0, page.width);
-                let py = ((pos.y - rect.top()) / scale).clamp(0.0, page.height.max(1.0));
+                ((pos.x - rect.left()) / scale, (pos.y - rect.top()) / scale)
+            };
+            // 严格命中：指针必须真的落在某一行文字上（含少量行间/行内容差）。
+            // 页边留白、段落之间的大块空白、分栏缝隙都不算命中，
+            // 避免点空白却选中离得最近的文字。
+            let to_flat = |pos: egui::Pos2| -> Option<usize> {
+                let (px, py) = page_pos(pos);
+                if px < 0.0 || px > page.width || py < 0.0 || py > page.height {
+                    return None;
+                }
+                let mut hit: Option<(f32, usize)> = None;
+                for (line_index, line) in page.lines.iter().enumerate() {
+                    let height = (line.rect.3 - line.rect.1).max(1.0);
+                    // 只容许上下 35% 行高的偏差；更大的空白一律不命中。
+                    if py < line.rect.1 - height * 0.35 || py > line.rect.3 + height * 0.35 {
+                        continue;
+                    }
+                    let distance = if py < line.rect.1 {
+                        line.rect.1 - py
+                    } else if py > line.rect.3 {
+                        py - line.rect.3
+                    } else {
+                        0.0
+                    };
+                    if hit.map_or(true, |(found, _)| distance < found) {
+                        hit = Some((distance, line_index));
+                    }
+                }
+                let (_, line_index) = hit?;
+                let line = &page.lines[line_index];
+                let height = (line.rect.3 - line.rect.1).max(1.0);
+                // 行首/行尾之外的横向空白同样不算命中。
+                if px < line.rect.0 - height * 0.5 || px > line.rect.2 + height * 0.5 {
+                    return None;
+                }
+                let mut offset = 0;
+                for prefix in &page.lines[..line_index] {
+                    offset += prefix.chars.len() + 1;
+                }
+                if line.chars.is_empty() {
+                    return Some(offset);
+                }
+                let mut char_index = 0;
+                let mut best_distance = f32::INFINITY;
+                for (position, character) in line.chars.iter().enumerate() {
+                    // 按到字符矩形外缘的距离算，落在字符内距离为 0。
+                    let distance = if px < character.rect.0 {
+                        character.rect.0 - px
+                    } else if px > character.rect.2 {
+                        px - character.rect.2
+                    } else {
+                        0.0
+                    };
+                    if distance < best_distance {
+                        best_distance = distance;
+                        char_index = position;
+                    }
+                }
+                // 分栏缝隙、制表位等行内大段空白也不命中。
+                if best_distance > height * 0.75 {
+                    return None;
+                }
+                Some(offset + char_index)
+            };
+            // 拖动扩选用的宽松命中：允许指针移到行外/页边，取最近的字符。
+            // 这样从文字上起拖后拖到行尾下方仍能扩到最后一个字；只在拖动过程中使用。
+            let to_flat_nearest = |pos: egui::Pos2| -> Option<usize> {
+                let (px, py) = page_pos(pos);
+                let px = px.clamp(0.0, page.width);
+                let py = py.clamp(0.0, page.height.max(1.0));
                 let mut best: Option<(f32, usize)> = None;
                 for (line_index, line) in page.lines.iter().enumerate() {
-                    let (y0, y1) = (line.rect.1, line.rect.3);
-                    let distance = if py < y0 {
-                        y0 - py
-                    } else if py > y1 {
-                        py - y1
+                    let distance = if py < line.rect.1 {
+                        line.rect.1 - py
+                    } else if py > line.rect.3 {
+                        py - line.rect.3
                     } else {
                         0.0
                     };
@@ -723,13 +791,8 @@ fn pdf_page_block(
                         best = Some((distance, line_index));
                     }
                 }
-                let (line_distance, line_index) = best?;
+                let (_, line_index) = best?;
                 let line = &page.lines[line_index];
-                let line_height = (line.rect.3 - line.rect.1).max(1.0);
-                // 纵向超过一行高才算「空白」，否则行间点击仍按最近的行取字。
-                if line_distance > line_height {
-                    return None;
-                }
                 let mut offset = 0;
                 for prefix in &page.lines[..line_index] {
                     offset += prefix.chars.len() + 1;
@@ -747,10 +810,6 @@ fn pdf_page_block(
                         char_index = position;
                     }
                 }
-                // 行首/行尾之外的横向空白同样不算命中。
-                if best_distance > line_height * 2.0 {
-                    return None;
-                }
                 Some(offset + char_index)
             };
 
@@ -760,10 +819,14 @@ fn pdf_page_block(
                 clicked = true;
             }
             let pointer = ui.input(|input| input.pointer.interact_pos());
-            let pressed = ui.input(|input| input.pointer.any_pressed());
+            // 指针落在选区工具条上时，按下与拖动都归工具条，
+            // 不能再重锚点页面选区（否则点「词典」之类的按钮会清掉/挪动选区）。
+            let over_toolbar =
+                pointer.is_some_and(|pos| block.is_some_and(|rect| rect.contains(pos)));
+            let pressed = ui.input(|input| input.pointer.any_pressed()) && !over_toolbar;
             // 用「按下是否发生在页面上」判定拖动归属：指针移出页面也继续扩选，
             // 且不会把滚动条/其它控件的拖动误算进来。
-            let carrying = response.is_pointer_button_down_on();
+            let carrying = response.is_pointer_button_down_on() && !over_toolbar;
             if carrying {
                 let position = pointer.and_then(to_flat);
                 if pressed && response.contains_pointer() && !response.double_clicked() {
@@ -778,16 +841,19 @@ fn pdf_page_block(
                     if position.is_none() {
                         *deselected = true;
                     }
-                } else if let Some(current) = select.as_mut().filter(|current| current.page == index) {
+                } else if let Some(current) =
+                    select.as_mut().filter(|current| current.page == index)
+                {
                     if current.dragging {
-                        if let Some(position) = position {
+                        // 拖动中允许指针离开文字（行尾下方、页边），取最近字符继续扩选。
+                        if let Some(position) = pointer.and_then(to_flat_nearest) {
                             current.cursor = position;
                         }
                     }
                 }
             }
             // 双击选词：按字符类别（字母数字 / CJK）向外扩展。
-            if response.double_clicked() {
+            if response.double_clicked() && !over_toolbar {
                 if let Some(position) = pointer.and_then(to_flat) {
                     let (start, end) = word_bounds(page, position);
                     *select = Some(PdfSelect {
@@ -799,7 +865,11 @@ fn pdf_page_block(
                 }
             }
 
-            if let Some(current) = select.as_ref().copied().filter(|current| current.page == index) {
+            if let Some(current) = select
+                .as_ref()
+                .copied()
+                .filter(|current| current.page == index)
+            {
                 // 起锚点与当前点相同表示「单击未拖动」，不是选区；
                 // 双击选词（`dragging == false`）即使只有一个字也算有效选区。
                 let has_range = !current.dragging || current.anchor != current.cursor;
@@ -813,32 +883,55 @@ fn pdf_page_block(
                 if has_range && end > start {
                     let scale = rect.width() / page.width.max(1.0);
                     let mut highlight = None::<egui::Rect>;
+                    // 逐行、逐段收集高亮矩形：跨行选区不能用一个大矩形，
+                    // 否则行间空白、分栏缝隙也会被涂上，看起来像选中了空白。
+                    let mut runs: Vec<egui::Rect> = Vec::new();
                     let mut collected = String::new();
+                    let mut has_picked_line = false;
                     let mut flat = 0;
                     for line in &page.lines {
+                        let line_gap = (line.rect.3 - line.rect.1).max(1.0) * 1.5 * scale;
+                        let mut run = None::<egui::Rect>;
+                        let mut line_text = String::new();
                         for character in &line.chars {
                             if flat >= start && flat < end {
-                                collected.push(character.c);
+                                line_text.push(character.c);
                                 let (x0, y0, x1, y1) = character.rect;
                                 let char_rect = egui::Rect::from_min_max(
                                     egui::pos2(rect.left() + x0 * scale, rect.top() + y0 * scale),
                                     egui::pos2(rect.left() + x1 * scale, rect.top() + y1 * scale),
                                 );
-                                highlight = Some(match highlight {
-                                    Some(merged) => merged.union(char_rect),
-                                    None => char_rect,
-                                });
+                                if let Some(existing) = run {
+                                    // 同一行内出现大段空白（分栏、制表位）时另起一段。
+                                    if char_rect.left() - existing.right() > line_gap {
+                                        runs.push(existing);
+                                        run = Some(char_rect);
+                                    } else {
+                                        run = Some(existing.union(char_rect));
+                                    }
+                                } else {
+                                    run = Some(char_rect);
+                                }
                             }
                             flat += 1;
                         }
-                        if flat >= start && flat < end {
-                            collected.push('\n');
+                        if let Some(run) = run {
+                            runs.push(run);
+                            if has_picked_line {
+                                collected.push('\n');
+                            }
+                            collected.push_str(&line_text);
+                            has_picked_line = true;
                         }
                         flat += 1;
                     }
-                    if let Some(highlight) = highlight {
+                    for run in &runs {
+                        highlight = Some(match highlight {
+                            Some(merged) => merged.union(*run),
+                            None => *run,
+                        });
                         ui.painter().rect_filled(
-                            highlight.expand(1.0),
+                            run.expand(1.0),
                             2.0,
                             ui.visuals().selection.bg_fill.gamma_multiply(0.55),
                         );
@@ -1070,29 +1163,33 @@ fn chapter_block(
                                     egui::pos2(piece_x, y),
                                     egui::vec2(piece_width, piece_height),
                                 );
-                                let id =
-                                    ui.make_persistent_id(("reader_text_inline", index, item_index));
+                                let id = ui.make_persistent_id((
+                                    "reader_text_inline",
+                                    index,
+                                    item_index,
+                                ));
                                 let base = next.start;
                                 let mut piece: &str = &chapter.text[base..base + piece_bytes];
-                                let mut layouter = |ui: &egui::Ui,
-                                                     buffer: &dyn egui::TextBuffer,
-                                                     wrap_width: f32| {
-                                    let job = styled_job(
-                                        ui,
-                                        &chapter.text,
-                                        base,
-                                        buffer.as_str().len().min(piece_bytes),
-                                        spans,
-                                        links,
-                                        annotations,
-                                        highlights,
-                                        font_size,
-                                        &family,
-                                        line_spacing,
-                                        wrap_width,
-                                    );
-                                    ui.fonts_mut(|fonts| fonts.layout_job(job))
-                                };
+                                let mut layouter =
+                                    |ui: &egui::Ui,
+                                     buffer: &dyn egui::TextBuffer,
+                                     wrap_width: f32| {
+                                        let job = styled_job(
+                                            ui,
+                                            &chapter.text,
+                                            base,
+                                            buffer.as_str().len().min(piece_bytes),
+                                            spans,
+                                            links,
+                                            annotations,
+                                            highlights,
+                                            font_size,
+                                            &family,
+                                            line_spacing,
+                                            wrap_width,
+                                        );
+                                        ui.fonts_mut(|fonts| fonts.layout_job(job))
+                                    };
                                 let inner = ui.scope_builder(
                                     egui::UiBuilder::new().max_rect(piece_rect),
                                     |ui| {
@@ -1127,8 +1224,7 @@ fn chapter_block(
                     }
                     None => {
                         ui.add_space(IMAGE_PADDING);
-                        let response =
-                            ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
+                        let response = ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
                         image_clicked |= response.clicked();
                         ui.add_space(IMAGE_PADDING);
                         last_text = None;
@@ -1228,9 +1324,7 @@ fn plan_window(
     // 内容不足一屏多时向下补足：总高度不够时 ScrollArea 会把滚动偏移夹小，
     // 跳到短章节就会停在原处，看起来“下一章无效”。
     let mut covered: f32 = (start..=end)
-        .map(|index| {
-            heights.get(&index).copied().unwrap_or(fallback_height) + separator_height
-        })
+        .map(|index| heights.get(&index).copied().unwrap_or(fallback_height) + separator_height)
         .sum();
     while covered <= bottom_limit && end + 1 < total {
         end += 1;
@@ -1271,30 +1365,29 @@ impl SepiolaApp {
         }
         let page_mode = self.library.reader.pdf_page_mode();
         let pointer_down = ui.input(|input| input.pointer.primary_down());
-        // 拖动选字期间绝不重排/重渲染：换 dpi 会清空页面与纹理，
-        // 版面和滚动位置跟着跳，选区也会断掉。
+        // 拖动选字期间绝不换 dpi：换 dpi 会触发重渲染，版面和选区都会跟着抖。
         if page_mode && width > 100.0 && !pointer_down {
-            // 按页在屏幕上实际占用的物理像素反推渲染分辨率，并超采样：
-            // 贴图缩放时的线性过滤会让 1:1 渲染显得发虚，多留像素明显更清晰。
-            let ppp = ui.ctx().pixels_per_point();
-            let page_pt_width = self
-                .library
-                .reader
-                .pdf_page_pt
-                .map(|(pt, _)| pt)
-                .filter(|pt| *pt > 1.0)
-                .unwrap_or(595.0);
-            let needed = width * ppp / (page_pt_width / 72.0);
-            // 纹理宽度上限换算成 dpi，避免超采样把显存吃满。
-            let texture_cap = PDF_TEXTURE_MAX_WIDTH as f32 * 72.0 / page_pt_width;
-            let target = (needed * PDF_OVERSAMPLE)
-                .min(texture_cap)
-                .clamp(96.0, 300.0);
-            let target = ((target / 10.0).round() * 10.0).max(96.0) as u32;
-            let current = self.library.reader.pdf_dpi;
-            // 留 8% 余量，避免窗口细微变化时反复重渲染。
-            if target != current && (target as f32 / current as f32 - 1.0).abs() > 0.08 {
-                self.library.reader.set_pdf_dpi(target);
+            // 页面点尺寸只认实际渲染结果。`mutool info` 的首页 mediabox 可能
+            // 属于封面等异常页（和正文尺寸差很多），用它算 dpi 会把正文页
+            // 渲染得过小、再被放大显示，字就发虚。
+            if let Some((page_pt_width, _)) =
+                self.library.reader.pdf_page_pt.filter(|(pt, _)| *pt > 1.0)
+            {
+                // 按页在屏幕上实际占用的物理像素反推渲染分辨率，1:1 贴图。
+                let ppp = ui.ctx().pixels_per_point();
+                let target = adaptive_pdf_dpi(width, ppp, page_pt_width);
+                let current = self.library.reader.pdf_dpi;
+                // 平常 2% 余量只用来过滤滚动条出现等 1~2px 的抖动；
+                // 有选区时把余量放大到 20%，避免点工具条按钮触发换分辨率，
+                // 但窗口明显变化时仍能修正清晰度。
+                let threshold = if self.library.reader.selection.is_some() {
+                    0.2
+                } else {
+                    0.02
+                };
+                if target != current && (target as f32 / current as f32 - 1.0).abs() > threshold {
+                    self.library.reader.set_pdf_dpi(target);
+                }
             }
         }
 
@@ -1333,11 +1426,7 @@ impl SepiolaApp {
             let pdf_page = page_mode.then(|| PdfPageView {
                 data: None,
                 dims: None,
-                aspect: self
-                    .library
-                    .reader
-                    .pdf_aspect
-                    .unwrap_or(DEFAULT_PDF_ASPECT),
+                aspect: self.library.reader.pdf_aspect.unwrap_or(DEFAULT_PDF_ASPECT),
             });
             let height = measure_chapter_height(
                 ui,
@@ -1350,7 +1439,8 @@ impl SepiolaApp {
                 measured_width,
                 pdf_page.as_ref(),
             );
-            self.library.reader
+            self.library
+                .reader
                 .chapter_heights
                 .insert(start_hint - 1, height);
         }
@@ -1388,17 +1478,22 @@ impl SepiolaApp {
             let request_lo = start.saturating_sub(1);
             let request_hi = (end + 1).min(total - 1);
             for page in request_lo..=request_hi {
-                let has_png = reader.pdf_pages.contains_key(&page);
+                // 页已按当前 dpi 渲染过才算就绪；换分辨率后旧位图仍显示，
+                // 但这里会重新请求新 dpi 的版本，到达后无缝替换。
+                let rendered = reader.pdf_rendered_dpi.get(&page).copied();
                 let text_known = !reader.pdf_has_text || reader.pdf_text.contains_key(&page);
-                if (has_png && text_known) || !reader.pdf_pending.insert(page) {
+                if (rendered == Some(reader.pdf_dpi) && text_known)
+                    || reader.pdf_pending.contains_key(&page)
+                {
                     continue;
                 }
                 if let Some(sender) = reader.pdf_sender.as_ref() {
                     // 章节序号从 0 起，PDF 页码从 1 起；文字层只在缺的时候取。
                     let need_text = reader.pdf_has_text && !reader.pdf_text.contains_key(&page);
-                    let _ = sender.send((page + 1, reader.pdf_dpi, need_text));
-                } else {
-                    reader.pdf_pending.remove(&page);
+                    let dpi = reader.pdf_dpi;
+                    if sender.send((page + 1, dpi, need_text)).is_ok() {
+                        reader.pdf_pending.insert(page, dpi);
+                    }
                 }
             }
             let keep_lo = start.saturating_sub(PDF_KEEP);
@@ -1411,6 +1506,12 @@ impl SepiolaApp {
                 .retain(|page, _| *page >= keep_lo && *page <= keep_hi);
             reader
                 .pdf_sizes
+                .retain(|page, _| *page >= keep_lo && *page <= keep_hi);
+            reader
+                .pdf_rendered_dpi
+                .retain(|page, _| *page >= keep_lo && *page <= keep_hi);
+            reader
+                .pdf_pending
                 .retain(|page, _| *page >= keep_lo && *page <= keep_hi);
             reader
                 .pdf_text
@@ -1491,7 +1592,7 @@ impl SepiolaApp {
                     .copied()
                     .collect();
                 let render = if page_mode {
-                    let (view, page_text) = {
+                    let (view, page_text, toolbar_rect) = {
                         let reader = &self.library.reader;
                         (
                             PdfPageView {
@@ -1500,6 +1601,7 @@ impl SepiolaApp {
                                 aspect: reader.pdf_aspect.unwrap_or(DEFAULT_PDF_ASPECT),
                             },
                             reader.pdf_text.get(&index).cloned().flatten(),
+                            reader.toolbar_rect.map(|rect| rect.expand(2.0)),
                         )
                     };
                     pdf_page_block(
@@ -1511,6 +1613,7 @@ impl SepiolaApp {
                         &mut self.library.reader.pdf_select,
                         &mut found,
                         &mut deselected,
+                        toolbar_rect,
                     )
                 } else {
                     chapter_block(
@@ -1618,12 +1721,9 @@ impl SepiolaApp {
                         }
                     }
                     // 从分析结果跳转过来：把选区落到条目上并滚动到它所在的行。
-                    if let Some((target, start_byte, end_byte)) =
-                        self.library.reader.pending_item
-                    {
+                    if let Some((target, start_byte, end_byte)) = self.library.reader.pending_item {
                         if target == index {
-                            let start_char = chapter.text
-                                [..start_byte.min(chapter.text.len())]
+                            let start_char = chapter.text[..start_byte.min(chapter.text.len())]
                                 .chars()
                                 .count();
                             let end_char = chapter.text[..end_byte.min(chapter.text.len())]
@@ -1642,10 +1742,12 @@ impl SepiolaApp {
                                 let mut state =
                                     egui::text_edit::TextEditState::load(ui.ctx(), segment.id)
                                         .unwrap_or_default();
-                                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                                    egui::text::CCursor::new(first),
-                                    egui::text::CCursor::new(last),
-                                )));
+                                state
+                                    .cursor
+                                    .set_char_range(Some(egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(first),
+                                        egui::text::CCursor::new(last),
+                                    )));
                                 state.store(ui.ctx(), segment.id);
                                 let head = text_output
                                     .galley
@@ -1799,8 +1901,7 @@ impl SepiolaApp {
                                 .is_some_and(|pos| rect.contains(pos))
                         })
                     });
-                ui.input(|input| input.key_pressed(egui::Key::Escape))
-                    || (clicked && !on_toolbar)
+                ui.input(|input| input.key_pressed(egui::Key::Escape)) || (clicked && !on_toolbar)
             };
 
         if let Some(selection) = found {
@@ -1852,6 +1953,24 @@ mod tests {
 
     fn heights(entries: &[(usize, f32)]) -> HashMap<usize, f32> {
         entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn adaptive_pdf_dpi_tracks_visible_physical_width() {
+        assert_eq!(adaptive_pdf_dpi(800.0, 2.0, 612.0), 189);
+    }
+
+    #[test]
+    fn adaptive_pdf_dpi_does_not_oversample() {
+        let target = adaptive_pdf_dpi(800.0, 1.0, 612.0);
+        assert_eq!(target, 96);
+        assert!(target <= 96);
+    }
+
+    #[test]
+    fn adaptive_pdf_dpi_clamps_to_supported_range() {
+        assert_eq!(adaptive_pdf_dpi(50.0, 1.0, 612.0), 96);
+        assert_eq!(adaptive_pdf_dpi(5000.0, 2.0, 612.0), 480);
     }
 
     #[test]
@@ -1932,13 +2051,7 @@ mod tests {
     fn extends_window_when_jumping_to_short_chapter() {
         // 跳到第 2 章时窗口只有 [2]，且这一章很短；不向下补足的话内容总高度不够，
         // ScrollArea 会把滚动偏移夹小，跳章就停在原处。
-        let map = heights(&[
-            (1, 800.0),
-            (2, 200.0),
-            (3, 200.0),
-            (4, 200.0),
-            (5, 200.0),
-        ]);
+        let map = heights(&[(1, 800.0), (2, 200.0), (3, 200.0), (4, 200.0), (5, 200.0)]);
         let plan = plan_window(6, 2, 2, 0.0, 400.0, &map, 800.0, 20.0, true);
         assert_eq!(plan.start, 1);
         assert!(plan.end > 2, "短章节要向下补足");
@@ -2017,7 +2130,18 @@ mod tests {
             );
             let top = ui.cursor().top();
             let mut textures = HashMap::new();
-            chapter_block(ui, 0, &chapter, &annotations, &[], 16.0, family, 1.0, 12.0, &mut textures);
+            chapter_block(
+                ui,
+                0,
+                &chapter,
+                &annotations,
+                &[],
+                16.0,
+                family,
+                1.0,
+                12.0,
+                &mut textures,
+            );
             sizes = Some((estimate, ui.cursor().top() - top));
         });
         // 无渲染后端，纹理增量直接丢弃。
@@ -2064,11 +2188,31 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| {
             let family = egui::FontFamily::Proportional;
             let width = ui.available_width();
-            let estimate =
-                measure_chapter_height(ui, &chapter, &[], 16.0, family.clone(), 1.0, 0.0, width, None);
+            let estimate = measure_chapter_height(
+                ui,
+                &chapter,
+                &[],
+                16.0,
+                family.clone(),
+                1.0,
+                0.0,
+                width,
+                None,
+            );
             let top = ui.cursor().top();
             let mut textures = HashMap::new();
-            chapter_block(ui, 0, &chapter, &[], &[], 16.0, family, 1.0, 0.0, &mut textures);
+            chapter_block(
+                ui,
+                0,
+                &chapter,
+                &[],
+                &[],
+                16.0,
+                family,
+                1.0,
+                0.0,
+                &mut textures,
+            );
             sizes = Some((estimate, ui.cursor().top() - top));
         });
         // 无渲染后端，纹理增量直接丢弃。
@@ -2119,11 +2263,31 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| {
             let family = egui::FontFamily::Proportional;
             let width = ui.available_width();
-            let estimate =
-                measure_chapter_height(ui, &chapter, &[], 16.0, family.clone(), 1.0, 0.0, width, None);
+            let estimate = measure_chapter_height(
+                ui,
+                &chapter,
+                &[],
+                16.0,
+                family.clone(),
+                1.0,
+                0.0,
+                width,
+                None,
+            );
             let top = ui.cursor().top();
             let mut textures = HashMap::new();
-            let render = chapter_block(ui, 0, &chapter, &[], &[], 16.0, family, 1.0, 0.0, &mut textures);
+            let render = chapter_block(
+                ui,
+                0,
+                &chapter,
+                &[],
+                &[],
+                16.0,
+                family,
+                1.0,
+                0.0,
+                &mut textures,
+            );
             sizes = Some((estimate, ui.cursor().top() - top, render.segments.len()));
         });
         output.textures_delta.clear();
@@ -2164,7 +2328,10 @@ mod tests {
         let chapter = Chapter {
             title: "两幅行内图".to_owned(),
             text: format!("{first}{middle}{tail}"),
-            images: vec![image_at(first.len()), image_at((first.to_owned() + middle).len())],
+            images: vec![
+                image_at(first.len()),
+                image_at((first.to_owned() + middle).len()),
+            ],
             ..Chapter::default()
         };
         let ctx = egui::Context::default();
@@ -2177,15 +2344,41 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| {
             let family = egui::FontFamily::Proportional;
             let width = ui.available_width();
-            let estimate =
-                measure_chapter_height(ui, &chapter, &[], 16.0, family.clone(), 1.0, 0.0, width, None);
+            let estimate = measure_chapter_height(
+                ui,
+                &chapter,
+                &[],
+                16.0,
+                family.clone(),
+                1.0,
+                0.0,
+                width,
+                None,
+            );
             let top = ui.cursor().top();
             let mut textures = HashMap::new();
-            let render = chapter_block(ui, 0, &chapter, &[], &[], 16.0, family, 1.0, 0.0, &mut textures);
+            let render = chapter_block(
+                ui,
+                0,
+                &chapter,
+                &[],
+                &[],
+                16.0,
+                family,
+                1.0,
+                0.0,
+                &mut textures,
+            );
             // 片段 1 是第一幅图右侧的续排，片段 2 是第二幅图右侧的续排，应在同一行。
             let y1 = render.segments[1].output.galley_pos.y;
             let y2 = render.segments[2].output.galley_pos.y;
-            sizes = Some((estimate, ui.cursor().top() - top, render.segments.len(), y1, y2));
+            sizes = Some((
+                estimate,
+                ui.cursor().top() - top,
+                render.segments.len(),
+                y1,
+                y2,
+            ));
         });
         output.textures_delta.clear();
         let (estimate, actual, segments, y1, y2) = sizes.expect("block should be rendered");

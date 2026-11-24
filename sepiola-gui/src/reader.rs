@@ -1,6 +1,6 @@
 //! 电子书阅读页（M44/M45）：后台解析、跨章连续滚动、选区工具条与阅读设置。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -10,10 +10,10 @@ use eframe::egui;
 use sepiola::config::{ReaderAiSettings, ReaderDictionarySettings, ReaderSettings};
 use sepiola::notebook::ai::{self as notebook_ai, CardDraft};
 use sepiola::reader::analysis_store::{self, BookAnalysis};
-use sepiola::reader::highlight::{BookHighlights, Highlight};
 use sepiola::reader::analyze::{
     self, Analysis, AnalysisItem, AnalysisProgress, Annotation, AnnotationKind,
 };
+use sepiola::reader::highlight::{BookHighlights, Highlight};
 use sepiola::reader::{BookDocument, ReaderFont, ReaderTheme, ReadingState};
 
 use crate::assets::pointing_hand;
@@ -125,7 +125,7 @@ pub struct ReaderState {
     pub chapter: usize,
     pub loading: bool,
     pub error: Option<String>,
-    /// 解析结果，附带 PDF 的页面点尺寸（其它格式为 `None`）。
+    /// 解析结果，附带 PDF 的正文页面点尺寸（其它格式为 `None`）。
     pub receiver: Option<Receiver<Result<(BookDocument, Option<(f32, f32)>), String>>>,
     pub font_size: f32,
     pub theme: ReaderTheme,
@@ -236,12 +236,14 @@ pub struct ReaderState {
     pub pdf_pages: HashMap<usize, Option<Arc<Vec<u8>>>>,
     /// 各页像素尺寸（渲染成功后填充），用于计算显示尺寸。
     pub pdf_sizes: HashMap<usize, (u32, u32)>,
-    /// 已发出渲染请求、尚未返回的页。
-    pub pdf_pending: BTreeSet<usize>,
+    /// 各页当前位图对应的 dpi；换分辨率时旧位图先留着显示，逐页替换。
+    pub pdf_rendered_dpi: HashMap<usize, u32>,
+    /// 已发出渲染请求及对应 dpi；换 dpi 时可区分新请求与旧结果。
+    pub pdf_pending: BTreeMap<usize, u32>,
     /// 渲染请求通道（每本 PDF 一个后台工作线程）：(页, dpi, 是否需要文字层)。
     pub pdf_sender: Option<Sender<(usize, u32, bool)>>,
     /// 渲染结果通道。
-    pub pdf_receiver: Option<Receiver<Result<PdfPageRender, (usize, String)>>>,
+    pub pdf_receiver: Option<Receiver<Result<PdfPageRender, (usize, u32, String)>>>,
     /// 首个成功页学到的宽高比（宽/高），未渲染页占位时按它估算高度。
     pub pdf_aspect: Option<f32>,
     /// 页面尺寸（点，1/72 英寸），由首次渲染反推；用于按屏幕像素算渲染分辨率。
@@ -349,7 +351,8 @@ impl Default for ReaderState {
             pdf_dpi: sepiola::reader::pdf::DEFAULT_DPI,
             pdf_pages: HashMap::new(),
             pdf_sizes: HashMap::new(),
-            pdf_pending: BTreeSet::new(),
+            pdf_rendered_dpi: HashMap::new(),
+            pdf_pending: BTreeMap::new(),
             pdf_sender: None,
             pdf_receiver: None,
             pdf_aspect: None,
@@ -363,19 +366,33 @@ impl Default for ReaderState {
 }
 
 impl ReaderState {
-    /// 调整 PDF 渲染分辨率：清掉旧 dpi 的页面数据与纹理，触发重新渲染。
+    /// 调整 PDF 渲染分辨率。
+    ///
+    /// 不清掉已渲染的页面：先把旧分辨率的位图继续显示，新 dpi 的页面到达后
+    /// 逐页替换（见 `poll_pdf_pages`）。否则换分辨率的一瞬间整页会退回
+    /// 「页面渲染中…」占位，表现为页面闪一下、重新渲染。
     /// 页面尺寸（点）与 dpi 无关，保留下来供下一次自适应计算。
     pub fn set_pdf_dpi(&mut self, dpi: u32) {
-        let dpi = dpi.clamp(72, 300);
+        let dpi = dpi.clamp(72, 480);
         if dpi == self.pdf_dpi {
             return;
         }
         self.pdf_dpi = dpi;
-        self.pdf_pages.clear();
-        self.pdf_sizes.clear();
+        // 在途请求按旧 dpi 返回时会被丢弃，清掉它们的 pending 标记后重新请求。
         self.pdf_pending.clear();
-        // 宽高比与页面点尺寸和 dpi 无关，版面高度也不变，无需清空。
-        self.image_textures.clear();
+    }
+
+    /// 只接收「当前页、当前 dpi」的后台渲染结果。
+    ///
+    /// 换 dpi 后旧请求和新请求可能同时在队列里，按结果 dpi 和 pending dpi
+    /// 双重匹配，避免旧结果清掉新请求或覆盖新位图。
+    pub fn take_pdf_pending(&mut self, page: usize, dpi: u32) -> bool {
+        if dpi == self.pdf_dpi && self.pdf_pending.get(&page).copied() == Some(dpi) {
+            self.pdf_pending.remove(&page);
+            true
+        } else {
+            false
+        }
     }
 
     /// 是否用页面位图显示：默认所有 PDF 都按页渲染（保留版面、文字可选中）；
@@ -420,8 +437,8 @@ impl SepiolaApp {
             .unwrap_or_else(|| rel.display().to_string());
         let (sender, receiver) = channel();
         let open_path = path.clone();
-        // PDF 的页面尺寸在解析线程里顺手读出来：首帧就按真实宽高比排版，
-        // 避免第一页渲染完成时版面跳动导致阅读位置漂移。
+        // PDF 的正文页面尺寸在解析线程里顺手读出来：首帧就按真实宽高比排版、
+        // 按真实尺寸算渲染分辨率，避免第一页用错 dpi 渲染发虚、尺寸跳动。
         let is_pdf = path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -435,9 +452,7 @@ impl SepiolaApp {
             let _ = sender.send(BookDocument::open(&open_path).map(|document| (document, size)));
         });
         // PDF 走页面渲染模式：起一个后台工作线程，按需渲染单页 PNG。
-        let pdf_cache_dir = root
-            .join(sepiola::library::LIBRARY_DIR)
-            .join("pdf_render");
+        let pdf_cache_dir = root.join(sepiola::library::LIBRARY_DIR).join("pdf_render");
         let (pdf_sender, pdf_receiver) = if is_pdf {
             Self::spawn_pdf_worker(path.clone(), pdf_cache_dir.clone())
         } else {
@@ -494,35 +509,36 @@ impl SepiolaApp {
         cache_dir: PathBuf,
     ) -> (
         Option<Sender<(usize, u32, bool)>>,
-        Option<Receiver<Result<PdfPageRender, (usize, String)>>>,
+        Option<Receiver<Result<PdfPageRender, (usize, u32, String)>>>,
     ) {
         let (req_tx, req_rx) = channel::<(usize, u32, bool)>();
         let (res_tx, res_rx) = channel();
         std::thread::spawn(move || {
             // Sender 被丢弃（换书）后循环退出。
             while let Ok((page, dpi, need_text)) = req_rx.recv() {
-                let result = match sepiola::reader::pdf::render_page_png(
-                    &path, page, dpi, &cache_dir,
-                ) {
-                    Ok(bytes) => match Self::png_dims(&bytes) {
-                        Some((width, height)) => {
-                            // 文字层与 dpi 无关；只在缺的时候取一次。
-                            let text = need_text
-                                .then(|| sepiola::reader::pdf::page_text_layout(&path, page).ok())
-                                .flatten();
-                            Ok(PdfPageRender {
-                                page,
-                                dpi,
-                                width,
-                                height,
-                                png: bytes,
-                                text,
-                            })
-                        }
-                        None => Err((page, "页面图片尺寸读取失败".to_string())),
-                    },
-                    Err(error) => Err((page, error)),
-                };
+                let result =
+                    match sepiola::reader::pdf::render_page_png(&path, page, dpi, &cache_dir) {
+                        Ok(bytes) => match Self::png_dims(&bytes) {
+                            Some((width, height)) => {
+                                // 文字层与 dpi 无关；只在缺的时候取一次。
+                                let text = need_text
+                                    .then(|| {
+                                        sepiola::reader::pdf::page_text_layout(&path, page).ok()
+                                    })
+                                    .flatten();
+                                Ok(PdfPageRender {
+                                    page,
+                                    dpi,
+                                    width,
+                                    height,
+                                    png: bytes,
+                                    text,
+                                })
+                            }
+                            None => Err((page, dpi, "页面图片尺寸读取失败".to_string())),
+                        },
+                        Err(error) => Err((page, dpi, error)),
+                    };
                 if res_tx.send(result).is_err() {
                     break;
                 }
@@ -558,10 +574,7 @@ impl SepiolaApp {
                         text,
                     } = rendered;
                     let reader = &mut self.library.reader;
-                    // 先清 pending，再判断是否过期：否则换 dpi 后旧结果被丢弃时
-                    // pending 会永远留着，这一页就再也不会重新渲染。
-                    let pending = reader.pdf_pending.remove(&page);
-                    if dpi != reader.pdf_dpi || !pending {
+                    if !reader.take_pdf_pending(page, dpi) {
                         continue;
                     }
                     // 每页都记下文字层结果：`None` 表示该页没有文字层，
@@ -573,17 +586,22 @@ impl SepiolaApp {
                     // 像素尺寸 ÷ dpi × 72 = 页面点尺寸；只学一次。
                     if reader.pdf_page_pt.is_none() && dpi > 0 && width > 0 && height > 0 {
                         let scale = 72.0 / dpi as f32;
-                        reader.pdf_page_pt =
-                            Some((width as f32 * scale, height as f32 * scale));
+                        reader.pdf_page_pt = Some((width as f32 * scale, height as f32 * scale));
                     }
                     reader.pdf_sizes.insert(page, (width, height));
                     reader.pdf_pages.insert(page, Some(Arc::new(png)));
+                    reader.pdf_rendered_dpi.insert(page, dpi);
+                    // 丢掉这一页旧 dpi 的纹理，下一帧按新位图重新解码；
+                    // 其它页的旧纹理继续显示，避免整页闪成占位。
+                    reader.image_textures.remove(&(page, 0));
                 }
-                Ok(Err((page, _error))) => {
+                Ok(Err((page, dpi, _error))) => {
                     let reader = &mut self.library.reader;
-                    reader.pdf_pending.remove(&page);
-                    // 标记失败，避免每帧重试。
-                    reader.pdf_pages.entry(page).or_insert(None);
+                    if reader.take_pdf_pending(page, dpi) {
+                        // 标记失败，避免相同 dpi 每帧重试。
+                        reader.pdf_pages.entry(page).or_insert(None);
+                        reader.pdf_rendered_dpi.insert(page, dpi);
+                    }
                 }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
@@ -601,9 +619,7 @@ impl SepiolaApp {
             Some(receiver) => match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("书籍解析线程已退出".to_string()))
-                }
+                Err(TryRecvError::Disconnected) => Some(Err("书籍解析线程已退出".to_string())),
             },
             None => None,
         };
@@ -629,7 +645,11 @@ impl SepiolaApp {
                         self.library.reader.pdf_aspect = Some(width / height);
                     }
                 }
-                if let Some(title) = document.title.clone().filter(|title| !title.trim().is_empty()) {
+                if let Some(title) = document
+                    .title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+                {
                     self.library.reader.title = title;
                 }
                 self.library.reader.author = document.author.clone().unwrap_or_default();
@@ -735,9 +755,7 @@ impl SepiolaApp {
             Some(receiver) => match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("分析线程已退出".to_string()))
-                }
+                Err(TryRecvError::Disconnected) => Some(Err("分析线程已退出".to_string())),
             },
             None => None,
         };
@@ -756,16 +774,17 @@ impl SepiolaApp {
                 };
                 let fingerprint = analysis_store::fingerprint(&target.text);
                 let now = sepiola::notebook::now_unix();
-                self.library.reader.book_selected.retain(|(index, _)| *index != chapter);
+                self.library
+                    .reader
+                    .book_selected
+                    .retain(|(index, _)| *index != chapter);
                 for index in 0..analysis.items.len() {
                     self.library.reader.book_selected.insert((chapter, index));
                 }
-                self.library.reader.book_analysis.insert(
-                    chapter,
-                    fingerprint,
-                    analysis,
-                    now,
-                );
+                self.library
+                    .reader
+                    .book_analysis
+                    .insert(chapter, fingerprint, analysis, now);
                 self.library.reader.show_annotations = true;
                 self.library.reader.analysis_open = true;
                 self.library.reader.analysis_error = None;
@@ -888,7 +907,13 @@ impl SepiolaApp {
             return;
         }
         if regenerate {
-            self.add_cards_from_texts(pending.seeds.iter().map(|seed| seed.front.clone()).collect());
+            self.add_cards_from_texts(
+                pending
+                    .seeds
+                    .iter()
+                    .map(|seed| seed.front.clone())
+                    .collect(),
+            );
             return;
         }
         // 沿用已有内容：分类写进卡片标签；没有生成过解释的条目仍交给 AI 生成。
@@ -964,9 +989,7 @@ impl SepiolaApp {
             Some(receiver) => match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("卡片生成线程已退出".to_string()))
-                }
+                Err(TryRecvError::Disconnected) => Some(Err("卡片生成线程已退出".to_string())),
             },
             None => None,
         };
@@ -978,7 +1001,12 @@ impl SepiolaApp {
                 let now = sepiola::notebook::now_unix();
                 let mut added = 0usize;
                 for draft in drafts {
-                    if self.notebook.notebook.find_duplicate(&draft.front).is_some() {
+                    if self
+                        .notebook
+                        .notebook
+                        .find_duplicate(&draft.front)
+                        .is_some()
+                    {
                         continue;
                     }
                     self.notebook
@@ -1368,15 +1396,12 @@ impl SepiolaApp {
 
     /// 发送追问：带上条目解释与最近几轮对话。
     pub fn send_item_chat(&mut self) {
-        let Some((chapter, item_index, loading, input)) =
-            self.library.reader.item_chat.as_ref().map(|chat| {
-                (
-                    chat.chapter,
-                    chat.item,
-                    chat.loading,
-                    chat.input.clone(),
-                )
-            })
+        let Some((chapter, item_index, loading, input)) = self
+            .library
+            .reader
+            .item_chat
+            .as_ref()
+            .map(|chat| (chat.chapter, chat.item, chat.loading, chat.input.clone()))
         else {
             return;
         };
@@ -1411,15 +1436,7 @@ impl SepiolaApp {
             .reader
             .item_chat
             .as_ref()
-            .map(|chat| {
-                chat.messages
-                    .iter()
-                    .rev()
-                    .take(6)
-                    .rev()
-                    .cloned()
-                    .collect()
-            })
+            .map(|chat| chat.messages.iter().rev().take(6).rev().cloned().collect())
             .unwrap_or_default();
         let mut user = format!(
             "书籍：{}\n章节：{}\n条目：{}\n",
@@ -1434,7 +1451,11 @@ impl SepiolaApp {
         if !history.is_empty() {
             user.push_str("最近对话：\n");
             for (is_user, text) in &history {
-                user.push_str(&format!("{}：{}\n", if *is_user { "用户" } else { "助手" }, text));
+                user.push_str(&format!(
+                    "{}：{}\n",
+                    if *is_user { "用户" } else { "助手" },
+                    text
+                ));
             }
         }
         user.push_str(&format!("用户问题：{question}"));
@@ -1460,9 +1481,7 @@ impl SepiolaApp {
             Some(receiver) => match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    Some(Err("追问线程已退出".to_string()))
-                }
+                Err(TryRecvError::Disconnected) => Some(Err("追问线程已退出".to_string())),
             },
             None => None,
         };
@@ -1662,14 +1681,13 @@ impl SepiolaApp {
                 if let Some(original) = &original {
                     let id = ui.scope_id().with(("anno_original", salt));
                     let width = ui.available_width();
-                    selection =
-                        selectable_text(ui, id, original, mono_font, width).or(selection);
+                    selection = selectable_text(ui, id, original, mono_font, width).or(selection);
                 }
                 if !annotation.note.is_empty() {
                     let id = ui.scope_id().with(("anno_note", salt));
                     let width = ui.available_width();
-                    selection = selectable_text(ui, id, &annotation.note, bold_font, width)
-                        .or(selection);
+                    selection =
+                        selectable_text(ui, id, &annotation.note, bold_font, width).or(selection);
                 }
                 if !annotation.detail.is_empty() {
                     let id = ui.scope_id().with(("anno_detail", salt));
@@ -1710,14 +1728,9 @@ impl SepiolaApp {
             });
         if let Some(selection) = popup_selection {
             // 浮层工具条由正文流每帧统一绘制；选区变化后催一帧，让它立刻出现。
-            let changed = self
-                .library
-                .reader
-                .selection
-                .as_ref()
-                .map_or(true, |old| {
-                    old.id != selection.id || old.text != selection.text || old.rect != selection.rect
-                });
+            let changed = self.library.reader.selection.as_ref().map_or(true, |old| {
+                old.id != selection.id || old.text != selection.text || old.rect != selection.rect
+            });
             if changed {
                 ctx.request_repaint();
             }
@@ -1768,9 +1781,10 @@ impl SepiolaApp {
 
     /// 把当前章节、字号、主题与字体写回 `.sepiola/reading.json`。
     pub fn save_reader_position(&mut self) {
-        let (Some(root), Some(rel)) =
-            (non_empty_root(&self.library.root), self.library.reader.rel.clone())
-        else {
+        let (Some(root), Some(rel)) = (
+            non_empty_root(&self.library.root),
+            self.library.reader.rel.clone(),
+        ) else {
             return;
         };
         let mut state = ReadingState::load(&root);
@@ -1881,9 +1895,10 @@ impl SepiolaApp {
 
     /// 高亮文件很小，改动后立即落盘。
     fn save_highlights(&mut self) {
-        let (Some(root), Some(rel)) =
-            (non_empty_root(&self.library.root), self.library.reader.rel.clone())
-        else {
+        let (Some(root), Some(rel)) = (
+            non_empty_root(&self.library.root),
+            self.library.reader.rel.clone(),
+        ) else {
             return;
         };
         let mut book = self.library.reader.highlights.clone();
@@ -1932,47 +1947,56 @@ impl SepiolaApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     back = pointing_hand(ui.button("← 关闭阅读")).clicked();
-            let title = self.library.reader.title.clone();
-            ui.add(egui::Label::new(egui::RichText::new(title).size(17.0).strong()).truncate());
-            let author = self.library.reader.author.clone();
-            if !author.is_empty() {
-                ui.weak(author);
-            }
-            if self
-                .library
-                .reader
-                .notice_until
-                .is_some_and(|until| Instant::now() < until)
-            {
-                ui.colored_label(egui::Color32::from_rgb(90, 150, 100), &self.library.reader.notice);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if pointing_hand(ui.button("阅读设置")).clicked() {
-                    self.library.reader.settings_open = !self.library.reader.settings_open;
-                }
-                let toc_label = if self.library.reader.toc_open {
-                    "收起目录"
-                } else {
-                    "目录"
-                };
-                if pointing_hand(ui.button(toc_label)).clicked() {
-                    self.library.reader.toc_open = !self.library.reader.toc_open;
-                }
-                if pointing_hand(ui.button("分析结果")).clicked() {
-                    self.library.reader.analysis_open = true;
-                }
-                let analyzing = self.library.reader.analysis_loading.is_some();
-                let label = if analyzing { "分析中…" } else { "分析本章" };
-                let enabled = !analyzing && self.library.reader.ai.enabled();
-                let response = ui
-                    .add_enabled(enabled, egui::Button::new(label))
-                    .on_disabled_hover_text(sepiola::ai::MISSING_HINT);
-                if pointing_hand(response).clicked() {
-                    self.start_analysis();
-                }
+                    let title = self.library.reader.title.clone();
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(title).size(17.0).strong()).truncate(),
+                    );
+                    let author = self.library.reader.author.clone();
+                    if !author.is_empty() {
+                        ui.weak(author);
+                    }
+                    if self
+                        .library
+                        .reader
+                        .notice_until
+                        .is_some_and(|until| Instant::now() < until)
+                    {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(90, 150, 100),
+                            &self.library.reader.notice,
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if pointing_hand(ui.button("阅读设置")).clicked() {
+                            self.library.reader.settings_open = !self.library.reader.settings_open;
+                        }
+                        let toc_label = if self.library.reader.toc_open {
+                            "收起目录"
+                        } else {
+                            "目录"
+                        };
+                        if pointing_hand(ui.button(toc_label)).clicked() {
+                            self.library.reader.toc_open = !self.library.reader.toc_open;
+                        }
+                        if pointing_hand(ui.button("分析结果")).clicked() {
+                            self.library.reader.analysis_open = true;
+                        }
+                        let analyzing = self.library.reader.analysis_loading.is_some();
+                        let label = if analyzing {
+                            "分析中…"
+                        } else {
+                            "分析本章"
+                        };
+                        let enabled = !analyzing && self.library.reader.ai.enabled();
+                        let response = ui
+                            .add_enabled(enabled, egui::Button::new(label))
+                            .on_disabled_hover_text(sepiola::ai::MISSING_HINT);
+                        if pointing_hand(response).clicked() {
+                            self.start_analysis();
+                        }
+                    });
+                });
             });
-            });
-        });
         if back {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             self.close_reader();
@@ -2002,18 +2026,14 @@ impl SepiolaApp {
             .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if pointing_hand(ui.add_enabled(
-                        chapter > 0,
-                        egui::Button::new("上一章"),
-                    ))
-                    .clicked()
+                    if pointing_hand(ui.add_enabled(chapter > 0, egui::Button::new("上一章")))
+                        .clicked()
                     {
                         navigation = Some(-1);
                     }
-                    if pointing_hand(ui.add_enabled(
-                        chapter + 1 < total,
-                        egui::Button::new("下一章"),
-                    ))
+                    if pointing_hand(
+                        ui.add_enabled(chapter + 1 < total, egui::Button::new("下一章")),
+                    )
                     .clicked()
                     {
                         navigation = Some(1);
@@ -2145,14 +2165,15 @@ impl SepiolaApp {
                                 for (index, item) in document.chapters.iter().enumerate() {
                                     // 目录标题已含章节号（如 Chapter 55）时不再加前缀，
                                     // 否则会与前置内容的文档序号混在一起造成编号错位。
-                                    let label = if sepiola::reader::chapter_number(&item.title).is_some()
-                                    {
-                                        item.title.clone()
-                                    } else {
-                                        format!("{} {}", index + 1, item.title)
-                                    };
+                                    let label =
+                                        if sepiola::reader::chapter_number(&item.title).is_some() {
+                                            item.title.clone()
+                                        } else {
+                                            format!("{} {}", index + 1, item.title)
+                                        };
                                     let current = index == self.library.reader.chapter;
-                                    if pointing_hand(ui.selectable_label(current, label)).clicked() {
+                                    if pointing_hand(ui.selectable_label(current, label)).clicked()
+                                    {
                                         *jump = Some(index);
                                         close = true;
                                     }
@@ -2199,7 +2220,8 @@ impl SepiolaApp {
         self.library.reader.chapter = chapter;
         self.library.reader.stream_start = chapter;
         self.library.reader.stream_end = chapter;
-        self.library.reader.stream_generation = self.library.reader.stream_generation.wrapping_add(1);
+        self.library.reader.stream_generation =
+            self.library.reader.stream_generation.wrapping_add(1);
         self.library.reader.stream_offset = 0.0;
         // 必须显式写回偏移，否则偏移恰好不变时（例如跳到第一章）ScrollArea
         // 会保留旧的内部偏移，跳转看起来没有生效。
@@ -2239,7 +2261,10 @@ pub fn merged_reader_settings(user: &crate::user_settings::UserSettings) -> Read
         (&user.ai_cli_path, &mut settings.ai.cli_path),
         (&user.ai_cli_args, &mut settings.ai.cli_args),
         (&user.ai_cli_model, &mut settings.ai.cli_model),
-        (&user.ai_prompt_translate, &mut settings.ai.prompts.translate),
+        (
+            &user.ai_prompt_translate,
+            &mut settings.ai.prompts.translate,
+        ),
         (&user.ai_prompt_explain, &mut settings.ai.prompts.explain),
         (&user.ai_prompt_analyze, &mut settings.ai.prompts.analyze),
         (&user.ai_prompt_exercise, &mut settings.ai.prompts.exercise),
@@ -2292,6 +2317,28 @@ impl SepiolaApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_pdf_result_does_not_clear_current_dpi_request() {
+        let mut reader = ReaderState::default();
+        reader.pdf_dpi = 200;
+        reader.pdf_pending.insert(3, 200);
+
+        assert!(!reader.take_pdf_pending(3, 150));
+        assert_eq!(reader.pdf_pending.get(&3), Some(&200));
+        assert!(reader.take_pdf_pending(3, 200));
+        assert!(!reader.pdf_pending.contains_key(&3));
+    }
+
+    #[test]
+    fn dpi_change_invalidates_pending_pdf_result() {
+        let mut reader = ReaderState::default();
+        reader.pdf_pending.insert(3, 150);
+        reader.set_pdf_dpi(200);
+
+        assert!(reader.pdf_pending.is_empty());
+        assert!(!reader.take_pdf_pending(3, 150));
+    }
 
     #[test]
     fn user_settings_override_config_file_values() {

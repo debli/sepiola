@@ -179,6 +179,16 @@ impl SepiolaApp {
                     egui::Id::new("reader_selection_toolbar"),
                 )),
         );
+        // 工具条自身要挡住它下面的页面/文字：按钮只感知点击，而页面控件感知
+        // 点击+拖拽，egui 会把按在按钮上的拖动同时算给页面，页面选区就被重新
+        // 锚定到按钮下方，表现为点工具条时选区（页面）乱跳。
+        // 在按钮之前铺一层只覆盖工具条矩形的透明拖拽区，作为按下时的拖拽目标；
+        // 按钮在其后创建，点击仍归按钮，工具条外的空白依旧可以穿透去拖选文字。
+        toolbar.interact(
+            egui::Rect::from_min_size(origin, size),
+            egui::Id::new("reader_selection_toolbar_guard"),
+            egui::Sense::click_and_drag(),
+        );
         let response = egui::Frame::popup(toolbar.style()).show(&mut toolbar, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("复制").clicked() {
