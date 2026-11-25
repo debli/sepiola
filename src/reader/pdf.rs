@@ -71,6 +71,14 @@ fn page_chapters(text: &str, pages: usize) -> Vec<Chapter> {
 /// 这里用 `mutool pages` 取每页的 CropBox（缺失时用 MediaBox），按页数最多的
 /// 尺寸作为整本书的代表尺寸，并处理 `/Rotate` 带来的宽高互换。
 pub fn page_size(path: &Path) -> Option<(f32, f32)> {
+    common_page_size(&page_sizes(path)?)
+}
+
+/// 每一页的实际尺寸（点，宽×高），顺序与页码一致。
+///
+/// 取值规则与 `page_size` 相同：优先 CropBox（缺省 MediaBox），并考虑 `/Rotate`。
+/// 同一本书里封面与正文尺寸常常不同，逐页尺寸才能让每页首帧就有正确的版面。
+pub fn page_sizes(path: &Path) -> Option<Vec<(f32, f32)>> {
     let output = std::process::Command::new("mutool")
         .arg("pages")
         .arg(path)
@@ -80,7 +88,7 @@ pub fn page_size(path: &Path) -> Option<(f32, f32)> {
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut counts: HashMap<(i64, i64), (usize, f32, f32)> = HashMap::new();
+    let mut sizes = Vec::new();
     let mut media = None;
     let mut crop = None;
     let mut rotate = 0;
@@ -98,14 +106,23 @@ pub fn page_size(path: &Path) -> Option<(f32, f32)> {
                 size = size.map(|(width, height)| (height, width));
             }
             if let Some((width, height)) = size {
-                let key = (width.round() as i64, height.round() as i64);
-                let entry = counts.entry(key).or_insert((0, width, height));
-                entry.0 += 1;
+                sizes.push((width, height));
             }
             media = None;
             crop = None;
             rotate = 0;
         }
+    }
+    (!sizes.is_empty()).then_some(sizes)
+}
+
+/// 出现次数最多的页面尺寸：正文页通常占多数，用它算渲染分辨率最稳。
+pub fn common_page_size(sizes: &[(f32, f32)]) -> Option<(f32, f32)> {
+    let mut counts: HashMap<(i64, i64), (usize, f32, f32)> = HashMap::new();
+    for &(width, height) in sizes {
+        let key = (width.round() as i64, height.round() as i64);
+        let entry = counts.entry(key).or_insert((0, width, height));
+        entry.0 += 1;
     }
     counts
         .into_iter()
@@ -517,7 +534,25 @@ mod tests {
         let (width, height) = page_size(&path).expect("page size");
         assert!((width - 612.0).abs() < 1.0);
         assert!((height - 792.0).abs() < 1.0);
+        let sizes = page_sizes(&path).expect("page sizes");
+        assert_eq!(sizes.len(), 1);
+        assert!((sizes[0].0 - 612.0).abs() < 1.0);
+        assert!((sizes[0].1 - 792.0).abs() < 1.0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn common_page_size_follows_the_majority_of_pages() {
+        // 封面常与正文尺寸不同；渲染分辨率要按占多数的正文页算。
+        let sizes = [
+            (965.0, 726.0),
+            (612.0, 792.0),
+            (612.0, 792.0),
+            (612.0, 792.0),
+        ];
+
+        assert_eq!(common_page_size(&sizes), Some((612.0, 792.0)));
+        assert_eq!(common_page_size(&[]), None);
     }
 
     #[test]

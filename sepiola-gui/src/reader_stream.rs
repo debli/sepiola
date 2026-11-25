@@ -100,6 +100,7 @@ fn styled_job(
         {
             SERIF_BOLD_FAMILY
         }
+        let _ = viewport_changed;
         _ => BOLD_FAMILY,
     };
     let bold_family = egui::FontFamily::Name(bold_name.into());
@@ -623,10 +624,61 @@ fn adaptive_pdf_dpi(width: f32, pixels_per_point: f32, page_pt_width: f32) -> u3
     needed.min(texture_cap).clamp(96.0, 480.0).ceil() as u32
 }
 
+fn pdf_dpi_viewport_changed(
+    previous: Option<(f32, f32)>,
+    width: f32,
+    pixels_per_point: f32,
+) -> bool {
+    previous.is_none_or(|(previous_width, previous_ppp)| {
+        (width - previous_width).abs() > 0.5 || (pixels_per_point - previous_ppp).abs() > 0.01
+    })
+}
+
+fn pdf_dpi_update_needed(
+    previous: Option<(f32, f32)>,
+    width: f32,
+    pixels_per_point: f32,
+    interaction_active: bool,
+) -> bool {
+    !interaction_active && pdf_dpi_viewport_changed(previous, width, pixels_per_point)
+}
+
+fn pdf_page_aspect(
+    dims: Option<(u32, u32)>,
+    page_aspect: Option<f32>,
+    fallback: f32,
+    text: Option<&PdfTextPage>,
+) -> f32 {
+    // 文字层尺寸（页面点，与 dpi 无关）最稳；其次是该页学到过的宽高比，
+    // 这样位图被清理/重新渲染时占位尺寸不变，页面不会先放大再缩回。
+    text.filter(|page| page.width > 0.0 && page.height > 0.0)
+        .map(|page| page.width / page.height)
+        .or(page_aspect)
+        .or_else(|| {
+            dims.and_then(|(width, height)| {
+                (width > 0 && height > 0).then_some(width as f32 / height as f32)
+            })
+        })
+        .unwrap_or(fallback)
+        .max(0.2)
+}
+
 /// PDF 页面渲染窗口外保留的页数（纹理与 PNG 数据）。
 const PDF_KEEP: usize = 2;
 /// 首个页面渲染完成前的兜底宽高比（宽/高），按 A4 估算。
 const DEFAULT_PDF_ASPECT: f32 = 1.0 / 1.4142;
+
+fn pointer_over_toolbar(pointer: Option<egui::Pos2>, buttons: &[egui::Rect]) -> bool {
+    pointer.is_some_and(|pos| buttons.iter().any(|rect| rect.contains(pos)))
+}
+
+fn reader_scroll_bar_visibility(page_mode: bool) -> egui::scroll_area::ScrollBarVisibility {
+    if page_mode {
+        egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+    } else {
+        egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+    }
+}
 
 /// PDF 页的渲染信息：数据就绪则贴图，否则按宽高比占位。
 pub struct PdfPageView {
@@ -634,6 +686,9 @@ pub struct PdfPageView {
     pub data: Option<Arc<Vec<u8>>>,
     /// 已知像素尺寸；未知时按 `aspect` 占位。
     pub dims: Option<(u32, u32)>,
+    /// 该页首次渲染时学到的宽高比（宽/高）。页面数据被清理或换 dpi 后仍然保留，
+    /// 保证同一页的显示尺寸不随位图是否就绪而变化。
+    pub page_aspect: Option<f32>,
     /// 兜底宽高比（宽/高），来自首个成功页。
     pub aspect: f32,
 }
@@ -649,21 +704,21 @@ fn pdf_page_block(
     select: &mut Option<PdfSelect>,
     found: &mut Option<Selection>,
     deselected: &mut bool,
-    block: Option<egui::Rect>,
+    toolbar_buttons: &[egui::Rect],
 ) -> ChapterRender {
     let width = ui.available_width();
-    let aspect = pdf.aspect.max(0.2);
+    let PdfPageView {
+        data,
+        dims,
+        page_aspect,
+        aspect,
+    } = pdf;
+    let aspect = pdf_page_aspect(dims, page_aspect, aspect, text);
     let mut page_rect = None;
-    let has_data = pdf.data.is_some();
-    if let Some(data) = pdf.data {
+    let has_data = data.is_some();
+    if let Some(data) = data {
         if let Some(texture) = pdf_page_texture(textures, ui.ctx(), index, &data) {
-            let (w, h) = pdf.dims.unwrap_or((1, 1));
-            let aspect = if w > 0 && h > 0 {
-                w as f32 / h as f32
-            } else {
-                aspect
-            };
-            let size = egui::Vec2::new(width, width / aspect.max(0.2));
+            let size = egui::Vec2::new(width, width / aspect);
             let (allocated, _) = ui.allocate_exact_size(size, egui::Sense::hover());
             // 位图对齐到物理像素网格：滚动偏移通常是小数，贴在非整数像素上时
             // 整页会被线性过滤重采样，文字看起来发虚。
@@ -698,11 +753,9 @@ fn pdf_page_block(
         );
         return ChapterRender {
             segments: Vec::new(),
-            image_clicked: false,
         };
     };
 
-    let mut clicked = false;
     if let Some(page) = text {
         if !page.lines.is_empty() && page.width > 0.0 {
             // 把指针位置换算成页面坐标（pt）。
@@ -815,14 +868,10 @@ fn pdf_page_block(
 
             let id = ui.make_persistent_id(("pdf_page_text", index));
             let response = ui.interact(rect, id, egui::Sense::click_and_drag());
-            if response.clicked() || response.drag_started() {
-                clicked = true;
-            }
             let pointer = ui.input(|input| input.pointer.interact_pos());
             // 指针落在选区工具条上时，按下与拖动都归工具条，
             // 不能再重锚点页面选区（否则点「词典」之类的按钮会清掉/挪动选区）。
-            let over_toolbar =
-                pointer.is_some_and(|pos| block.is_some_and(|rect| rect.contains(pos)));
+            let over_toolbar = pointer_over_toolbar(pointer, toolbar_buttons);
             let pressed = ui.input(|input| input.pointer.any_pressed()) && !over_toolbar;
             // 用「按下是否发生在页面上」判定拖动归属：指针移出页面也继续扩选，
             // 且不会把滚动条/其它控件的拖动误算进来。
@@ -952,7 +1001,6 @@ fn pdf_page_block(
 
     ChapterRender {
         segments: Vec::new(),
-        image_clicked: clicked,
     }
 }
 
@@ -992,8 +1040,6 @@ fn word_bounds(page: &PdfTextPage, position: usize) -> (usize, usize) {
 struct ChapterRender {
     /// 各正文段的控件信息（插图把正文切成了多段）。
     segments: Vec<SegmentRender>,
-    /// 本帧是否点击了章节内的插图。
-    image_clicked: bool,
 }
 
 /// 一个正文段的渲染结果；`char_base` 是该段首字符在章节全文中的字符序号。
@@ -1034,7 +1080,6 @@ fn chapter_block(
         + ui.spacing().extra_text_line_spacing)
         * line_spacing.max(0.5);
     let mut rendered = Vec::new();
-    let mut image_clicked = false;
     let mut char_base = 0usize;
     // 紧邻上一项的文字段下标；插图之后清空，避免行内图贴到更早的行上。
     let mut last_text: Option<usize> = None;
@@ -1135,9 +1180,7 @@ fn chapter_block(
                         // `put` 会把游标推进到图片底部之后；图比这一行矮时会被拉回上方，
                         // 这里再补上差值，保证后续正文不会压到文字上。
                         let before = ui.cursor().top();
-                        let response =
-                            ui.put(rect, egui::Image::new(&texture).fit_to_exact_size(size));
-                        image_clicked |= response.clicked();
+                        ui.put(rect, egui::Image::new(&texture).fit_to_exact_size(size));
                         let mut line_bottom = ui.cursor().top();
                         if line_bottom < before {
                             ui.add_space(before - line_bottom);
@@ -1224,8 +1267,7 @@ fn chapter_block(
                     }
                     None => {
                         ui.add_space(IMAGE_PADDING);
-                        let response = ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
-                        image_clicked |= response.clicked();
+                        ui.add(egui::Image::new(&texture).fit_to_exact_size(size));
                         ui.add_space(IMAGE_PADDING);
                         last_text = None;
                     }
@@ -1233,10 +1275,7 @@ fn chapter_block(
             }
         }
     }
-    ChapterRender {
-        segments: rendered,
-        image_clicked,
-    }
+    ChapterRender { segments: rendered }
 }
 
 /// 滑动窗口的计算结果。
@@ -1364,9 +1403,24 @@ impl SepiolaApp {
             self.library.reader.stream_inner_width = 0.0;
         }
         let page_mode = self.library.reader.pdf_page_mode();
-        let pointer_down = ui.input(|input| input.pointer.primary_down());
-        // 拖动选字期间绝不换 dpi：换 dpi 会触发重渲染，版面和选区都会跟着抖。
-        if page_mode && width > 100.0 && !pointer_down {
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let viewport_changed = pdf_dpi_viewport_changed(
+            self.library.reader.pdf_dpi_viewport,
+            width,
+            pixels_per_point,
+        );
+        let interaction_active =
+            self.library.reader.selection.is_some() || ui.input(|input| input.pointer.any_down());
+        let dpi_update_needed = pdf_dpi_update_needed(
+            self.library.reader.pdf_dpi_viewport,
+            width,
+            pixels_per_point,
+            interaction_active,
+        );
+        // 选区或指针交互期间暂缓换分辨率，避免工具条点击时的瞬时布局变化触发整页重渲染。
+        // 交互结束后仍会按实际视口尺寸更新。
+        if page_mode && width > 100.0 && dpi_update_needed {
+            self.library.reader.pdf_dpi_viewport = Some((width, pixels_per_point));
             // 页面点尺寸只认实际渲染结果。`mutool info` 的首页 mediabox 可能
             // 属于封面等异常页（和正文尺寸差很多），用它算 dpi 会把正文页
             // 渲染得过小、再被放大显示，字就发虚。
@@ -1374,17 +1428,10 @@ impl SepiolaApp {
                 self.library.reader.pdf_page_pt.filter(|(pt, _)| *pt > 1.0)
             {
                 // 按页在屏幕上实际占用的物理像素反推渲染分辨率，1:1 贴图。
-                let ppp = ui.ctx().pixels_per_point();
-                let target = adaptive_pdf_dpi(width, ppp, page_pt_width);
+                let target = adaptive_pdf_dpi(width, pixels_per_point, page_pt_width);
                 let current = self.library.reader.pdf_dpi;
-                // 平常 2% 余量只用来过滤滚动条出现等 1~2px 的抖动；
-                // 有选区时把余量放大到 20%，避免点工具条按钮触发换分辨率，
-                // 但窗口明显变化时仍能修正清晰度。
-                let threshold = if self.library.reader.selection.is_some() {
-                    0.2
-                } else {
-                    0.02
-                };
+                // 2% 余量只过滤滚动条出现等 1~2px 的抖动。
+                let threshold = 0.02;
                 if target != current && (target as f32 / current as f32 - 1.0).abs() > threshold {
                     self.library.reader.set_pdf_dpi(target);
                 }
@@ -1426,6 +1473,12 @@ impl SepiolaApp {
             let pdf_page = page_mode.then(|| PdfPageView {
                 data: None,
                 dims: None,
+                page_aspect: self
+                    .library
+                    .reader
+                    .pdf_page_aspect
+                    .get(&(start_hint - 1))
+                    .copied(),
                 aspect: self.library.reader.pdf_aspect.unwrap_or(DEFAULT_PDF_ASPECT),
             });
             let height = measure_chapter_height(
@@ -1491,7 +1544,7 @@ impl SepiolaApp {
                     // 章节序号从 0 起，PDF 页码从 1 起；文字层只在缺的时候取。
                     let need_text = reader.pdf_has_text && !reader.pdf_text.contains_key(&page);
                     let dpi = reader.pdf_dpi;
-                    if sender.send((page + 1, dpi, need_text)).is_ok() {
+                    if sender.send((page, dpi, need_text)).is_ok() {
                         reader.pdf_pending.insert(page, dpi);
                     }
                 }
@@ -1513,6 +1566,10 @@ impl SepiolaApp {
             reader
                 .pdf_pending
                 .retain(|page, _| *page >= keep_lo && *page <= keep_hi);
+            if !reader.pdf_pending.is_empty() {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+            }
             reader
                 .pdf_text
                 .retain(|page, _| *page >= keep_lo && *page <= keep_hi);
@@ -1523,7 +1580,7 @@ impl SepiolaApp {
             {
                 reader.pdf_select = None;
                 reader.selection = None;
-                reader.toolbar_rect = None;
+                reader.toolbar_button_rects.clear();
             }
         }
 
@@ -1554,8 +1611,6 @@ impl SepiolaApp {
         let mut anchors: Vec<(usize, usize, usize, egui::Pos2, Arc<egui::Galley>)> = Vec::new();
         let mut measured: Vec<(usize, f32)> = Vec::new();
         let mut separator_seen = 0.0_f32;
-        // 点中正文（含浮层下方穿透过来的点击）时应关闭工具条。
-        let mut clicked_text = false;
         // 点中脚注/跨章链接时的目标（章节文本按需跳转或弹出脚注）。
         let mut clicked_link: Option<LinkTarget> = None;
         // 点中 AI 彩标时弹出的条目。
@@ -1564,6 +1619,9 @@ impl SepiolaApp {
         let mut scroll = egui::ScrollArea::vertical()
             .id_salt(("reader_stream", generation))
             .auto_shrink([false, false])
+            // PDF 页面按可用宽度缩放；动态显示滚动条会改变内容宽度，
+            // 进而让页面在滚动条出现/收起时短暂放大或缩小。
+            .scroll_bar_visibility(reader_scroll_bar_visibility(page_mode))
             // 正文里的拖动用于选字，不能被滚动区当成“拖动滚动”
             // （触屏/触摸板尤其明显，会表现为边选边滚）。
             .scroll_source(egui::scroll_area::ScrollSource {
@@ -1592,16 +1650,17 @@ impl SepiolaApp {
                     .copied()
                     .collect();
                 let render = if page_mode {
-                    let (view, page_text, toolbar_rect) = {
+                    let (view, page_text, toolbar_button_rects) = {
                         let reader = &self.library.reader;
                         (
                             PdfPageView {
                                 data: reader.pdf_pages.get(&index).cloned().flatten(),
                                 dims: reader.pdf_sizes.get(&index).copied(),
+                                page_aspect: reader.pdf_page_aspect.get(&index).copied(),
                                 aspect: reader.pdf_aspect.unwrap_or(DEFAULT_PDF_ASPECT),
                             },
                             reader.pdf_text.get(&index).cloned().flatten(),
-                            reader.toolbar_rect.map(|rect| rect.expand(2.0)),
+                            reader.toolbar_button_rects.clone(),
                         )
                     };
                     pdf_page_block(
@@ -1613,7 +1672,7 @@ impl SepiolaApp {
                         &mut self.library.reader.pdf_select,
                         &mut found,
                         &mut deselected,
-                        toolbar_rect,
+                        &toolbar_button_rects,
                     )
                 } else {
                     chapter_block(
@@ -1629,7 +1688,6 @@ impl SepiolaApp {
                         &mut self.library.reader.image_textures,
                     )
                 };
-                clicked_text |= render.image_clicked;
                 // 恢复阅读位置：把锚点那一行滚到视口顶部（只做一次）。
                 if self.library.reader.restore_anchor.is_some()
                     && index == self.library.reader.position_chapter
@@ -1673,7 +1731,6 @@ impl SepiolaApp {
                 let mut candidate: Option<(bool, Selection)> = None;
                 for segment in &segments {
                     let text_output = &segment.output;
-                    clicked_text |= text_output.response.response.clicked();
                     if text_output.response.response.clicked() {
                         if let Some(range) = text_output.cursor_range {
                             let char_index = segment.char_base
@@ -1805,7 +1862,7 @@ impl SepiolaApp {
         // 按在页面空白处：选区与工具条立即收起（拖动松手不会产生 click 事件）。
         if deselected {
             self.library.reader.selection = None;
-            self.library.reader.toolbar_rect = None;
+            self.library.reader.toolbar_button_rects.clear();
         }
 
         let viewport_top = output.inner_rect.top();
@@ -1892,15 +1949,9 @@ impl SepiolaApp {
             && !ui.input(|input| input.pointer.primary_down())
             && {
                 let clicked = ui.input(|input| input.pointer.any_click());
-                let on_toolbar = !clicked_text
-                    && self.library.reader.toolbar_rect.is_some_and(|rect| {
-                        ui.input(|input| {
-                            input
-                                .pointer
-                                .interact_pos()
-                                .is_some_and(|pos| rect.contains(pos))
-                        })
-                    });
+                let pointer = ui.input(|input| input.pointer.interact_pos());
+                let on_toolbar =
+                    pointer_over_toolbar(pointer, &self.library.reader.toolbar_button_rects);
                 ui.input(|input| input.key_pressed(egui::Key::Escape)) || (clicked && !on_toolbar)
             };
 
@@ -1909,7 +1960,7 @@ impl SepiolaApp {
             self.library.reader.selection = Some(selection);
         } else if dismiss {
             self.library.reader.selection = None;
-            self.library.reader.toolbar_rect = None;
+            self.library.reader.toolbar_button_rects.clear();
             self.library.reader.pdf_select = None;
         }
 
@@ -1929,7 +1980,7 @@ impl SepiolaApp {
             Some(LinkTarget::Footnote(text)) => {
                 self.library.reader.footnote = Some(text);
                 self.library.reader.selection = None;
-                self.library.reader.toolbar_rect = None;
+                self.library.reader.toolbar_button_rects.clear();
             }
             None => {}
         }
@@ -1953,6 +2004,557 @@ mod tests {
 
     fn heights(entries: &[(usize, f32)]) -> HashMap<usize, f32> {
         entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn pointer_over_toolbar_requires_toolbar_hit() {
+        let toolbar = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(300.0, 40.0));
+        let buttons = [toolbar];
+
+        assert!(pointer_over_toolbar(
+            Some(egui::pos2(150.0, 120.0)),
+            &buttons
+        ));
+        assert!(!pointer_over_toolbar(
+            Some(egui::pos2(50.0, 120.0)),
+            &buttons
+        ));
+        assert!(!pointer_over_toolbar(None, &buttons));
+        assert!(!pointer_over_toolbar(Some(egui::pos2(150.0, 120.0)), &[]));
+    }
+
+    #[test]
+    fn pdf_dpi_viewport_changes_only_for_layout_or_scale_changes() {
+        let previous = Some((600.0, 1.5));
+
+        assert!(!pdf_dpi_viewport_changed(previous, 600.25, 1.505));
+        assert!(pdf_dpi_viewport_changed(previous, 640.0, 1.5));
+        assert!(pdf_dpi_viewport_changed(previous, 600.0, 2.0));
+    }
+
+    #[test]
+    fn pdf_dpi_update_waits_until_selection_interaction_ends() {
+        let previous = Some((600.0, 1.5));
+
+        assert!(!pdf_dpi_update_needed(previous, 640.0, 1.5, true));
+        assert!(!pdf_dpi_update_needed(previous, 600.0, 1.5, false));
+        assert!(pdf_dpi_update_needed(previous, 640.0, 1.5, false));
+    }
+
+    #[test]
+    fn pdf_page_aspect_uses_stable_text_page_dimensions() {
+        let text = PdfTextPage {
+            width: 612.5,
+            height: 792.0,
+            lines: Vec::new(),
+        };
+        let low_dpi = pdf_page_aspect(Some((817, 1056)), None, 0.75, Some(&text));
+        let high_dpi = pdf_page_aspect(Some((1276, 1650)), None, 0.75, Some(&text));
+
+        assert_eq!(low_dpi, high_dpi);
+        assert!((low_dpi - (612.5 / 792.0)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pdf_page_keeps_its_aspect_while_the_bitmap_is_missing() {
+        // 位图被清理（或等待重新渲染）时，占位尺寸必须还是这一页自己的宽高比，
+        // 不能退回别的页（比如封面）的比例，否则页面会先放大再缩回。
+        let learned = 612.0 / 792.0;
+        let placeholder = pdf_page_aspect(None, Some(learned), 1.0, None);
+        let with_bitmap = pdf_page_aspect(Some((1224, 1584)), Some(learned), 1.0, None);
+
+        assert_eq!(placeholder, with_bitmap);
+        assert!((placeholder - learned).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pdf_scroll_area_width_stays_stable_when_content_height_changes() {
+        let ctx = egui::Context::default();
+        let frame = |content_height: f32, time: f64| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            ));
+            input.time = Some(time);
+            let mut inner_width = 0.0;
+            let mut output = ctx.run_ui(input, |ui| {
+                let result = egui::ScrollArea::vertical()
+                    .id_salt("pdf_scroll_width_regression")
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(reader_scroll_bar_visibility(true))
+                    .show(ui, |ui| ui.add_space(content_height));
+                inner_width = result.inner_rect.width();
+            });
+            output.textures_delta.clear();
+            inner_width
+        };
+
+        let mut time = 0.0;
+        let mut widths_with_overflow = Vec::new();
+        for _ in 0..10 {
+            widths_with_overflow.push(frame(1000.0, time));
+            time += 0.1;
+        }
+        let mut width_without_overflow = 0.0;
+        for _ in 0..20 {
+            width_without_overflow = frame(100.0, time);
+            time += 0.1;
+        }
+
+        assert!(
+            widths_with_overflow
+                .iter()
+                .all(|width| (*width - widths_with_overflow[0]).abs() <= 0.5),
+            "PDF content width changed while the scroll area initialized: {widths_with_overflow:?}"
+        );
+        assert_eq!(
+            widths_with_overflow[0], width_without_overflow,
+            "content height changes must not change PDF page width"
+        );
+    }
+
+    #[test]
+    fn pdf_toolbar_dictionary_keeps_page_geometry_stable() {
+        let ctx = egui::Context::default();
+        let mut app = SepiolaApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        app.library.root.clear();
+        app.library.reader = crate::reader::ReaderState::default();
+        let document = Arc::new(BookDocument {
+            is_pdf: true,
+            chapters: vec![Chapter {
+                text: "abcdefghij".into(),
+                ..Chapter::default()
+            }],
+            ..BookDocument::default()
+        });
+        let reader = &mut app.library.reader;
+        reader.rel = Some("test.pdf".into());
+        reader.title = "Database Architecture".into();
+        reader.pdf_path = Some("test.pdf".into());
+        reader.pdf_has_text = true;
+        reader.document = Some(document);
+        reader.pdf_page_pt = Some((414.0, 639.0));
+        reader.pdf_page_aspect.insert(0, 414.0 / 639.0);
+        reader.dictionary = sepiola::config::ReaderDictionarySettings {
+            url: "invalid".into(),
+        };
+        reader.pdf_rendered_dpi.insert(0, reader.pdf_dpi);
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            414,
+            639,
+            image::Rgba([255, 255, 255, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode png");
+        reader.pdf_pages.insert(0, Some(Arc::new(png)));
+        reader.pdf_text.insert(
+            0,
+            Some(Arc::new(PdfTextPage {
+                width: 414.0,
+                height: 639.0,
+                lines: vec![sepiola::reader::pdf::PdfTextLine {
+                    rect: (10.0, 20.0, 90.0, 30.0),
+                    chars: "abcdefghij"
+                        .chars()
+                        .enumerate()
+                        .map(|(index, c)| {
+                            let left = 10.0 + index as f32 * 8.0;
+                            sepiola::reader::pdf::PdfChar {
+                                c,
+                                rect: (left, 20.0, left + 6.0, 30.0),
+                            }
+                        })
+                        .collect(),
+                }],
+            })),
+        );
+        let mut time = 0.0;
+        let reader_viewport = egui::ViewportId::from_hash_of("reader_window");
+        let mut frame = |app: &mut SepiolaApp, events: Vec<egui::Event>| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 720.0),
+            ));
+            input.viewport_id = reader_viewport;
+            input.viewports.insert(
+                reader_viewport,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    native_pixels_per_point: Some(1.0),
+                    ..Default::default()
+                },
+            );
+            input.time = Some(time);
+            input.events = events;
+            time += 0.1;
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| app.reader_ui(ui));
+            });
+            let texture = app.library.reader.image_textures[&(0, 0)]
+                .as_ref()
+                .expect("page texture")
+                .id();
+            let page_rect = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                        Some(mesh.calc_bounds())
+                    }
+                    _ => None,
+                })
+                .expect("painted PDF page");
+            let repaint_delay = output.viewport_output[&reader_viewport].repaint_delay;
+            output.textures_delta.clear();
+            (page_rect, repaint_delay)
+        };
+        for _ in 0..10 {
+            frame(&mut app, Vec::new());
+        }
+        let (before, _) = frame(&mut app, Vec::new());
+        let page_scale = before.width() / 414.0;
+        let text_point = |index: usize| {
+            egui::pos2(
+                before.left() + (13.0 + index as f32 * 8.0) * page_scale,
+                before.top() + 25.0 * page_scale,
+            )
+        };
+        let press = |point| {
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        frame(&mut app, press(text_point(1)));
+        frame(&mut app, vec![egui::Event::PointerMoved(text_point(5))]);
+        let (after_selection, _) = frame(
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: text_point(5),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(after_selection, before);
+        assert!(
+            app.library.reader.selection.is_some(),
+            "dragging over PDF text should create a toolbar selection"
+        );
+        let button = app.library.reader.toolbar_button_rects[5].center();
+        let event = |pressed| egui::Event::PointerButton {
+            pos: button,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = &mut app.library.reader;
+        reader.pdf_pending.insert(0, reader.pdf_dpi);
+        reader.pdf_receiver = Some(receiver);
+        let (_, repaint_delay) = frame(&mut app, Vec::new());
+        assert!(
+            repaint_delay <= std::time::Duration::from_millis(100),
+            "pending PDF renders must be polled without another user interaction"
+        );
+        let dpi_before_toolbar = app.library.reader.pdf_dpi;
+        app.library.reader.pdf_dpi_viewport = Some((0.0, 1.0));
+        let (pressed, _) = frame(
+            &mut app,
+            vec![egui::Event::PointerMoved(button), event(true)],
+        );
+        assert_eq!(
+            app.library.reader.pdf_dpi, dpi_before_toolbar,
+            "PDF DPI must not change while a toolbar interaction is active"
+        );
+        let mut rerendered_png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            414,
+            640,
+            image::Rgba([255, 255, 255, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut rerendered_png),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode rerendered png");
+        sender
+            .send(Ok(crate::reader::PdfPageRender {
+                page: 0,
+                dpi: app.library.reader.pdf_dpi,
+                width: 414,
+                height: 640,
+                png: rerendered_png,
+                text: None,
+            }))
+            .expect("send render result");
+        app.poll_pdf_pages();
+        assert!(
+            app.library.reader.pdf_text[&0].is_some(),
+            "a bitmap-only rerender must preserve the text layer"
+        );
+        assert_eq!(app.library.reader.pdf_page_aspect[&0], 414.0 / 639.0);
+        let (released, _) = frame(&mut app, vec![event(false)]);
+        assert!(
+            app.library.reader.selection.is_none(),
+            "dictionary button must be clicked"
+        );
+        assert_eq!(
+            app.library.reader.pdf_dpi, dpi_before_toolbar,
+            "clicking the toolbar must not trigger a PDF rerender"
+        );
+        assert!(app.library.reader.notice.starts_with("词典地址无效"));
+        let (with_notice, _) = frame(&mut app, Vec::new());
+        app.library.reader.notice_until = None;
+        let (after_notice, _) = frame(&mut app, Vec::new());
+
+        for rect in [pressed, released, with_notice, after_notice] {
+            assert_eq!(
+                rect, before,
+                "PDF page geometry changed after toolbar click"
+            );
+        }
+        app.library
+            .reader
+            .pdf_pending
+            .insert(0, app.library.reader.pdf_dpi);
+        drop(sender);
+        app.poll_pdf_pages();
+        assert!(app.library.reader.pdf_pending.is_empty());
+        assert!(app.library.reader.pdf_receiver.is_none());
+        assert_eq!(app.library.reader.notice, "PDF 页面渲染线程已退出");
+    }
+
+    #[test]
+    fn pdf_page_allows_repeated_text_selection() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            100,
+            100,
+            image::Rgba([255, 255, 255, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode png");
+        let data = Arc::new(png);
+        let page = PdfTextPage {
+            width: 100.0,
+            height: 100.0,
+            lines: vec![sepiola::reader::pdf::PdfTextLine {
+                rect: (10.0, 20.0, 90.0, 30.0),
+                chars: "abcdefghij"
+                    .chars()
+                    .enumerate()
+                    .map(|(index, c)| {
+                        let left = 10.0 + index as f32 * 8.0;
+                        sepiola::reader::pdf::PdfChar {
+                            c,
+                            rect: (left, 20.0, left + 6.0, 30.0),
+                        }
+                    })
+                    .collect(),
+            }],
+        };
+        let ctx = egui::Context::default();
+        let mut textures = HashMap::new();
+        let mut select = None;
+        let mut time = 0.0;
+        let mut toolbar_active = false;
+        let mut toolbar_button_rects = Vec::new();
+        let mut run_frame = |events: Vec<egui::Event>| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 800.0),
+            ));
+            input.time = Some(time);
+            input.events = events;
+            time += 0.1;
+
+            let mut selected_text = None;
+            let mut page_geometry = (egui::Pos2::ZERO, 0.0);
+            let mut copy_clicked = false;
+            let mut copy_button_rect = None;
+            let mut toolbar_frame_rect = None;
+            let mut output = ctx.run_ui(input, |ui| {
+                let page_origin = ui.cursor().min;
+                let page_width = ui.available_width();
+                let mut found = None;
+                let mut deselected = false;
+                pdf_page_block(
+                    ui,
+                    0,
+                    PdfPageView {
+                        data: Some(data.clone()),
+                        dims: Some((100, 100)),
+                        page_aspect: None,
+                        aspect: 1.0,
+                    },
+                    &mut textures,
+                    Some(&page),
+                    &mut select,
+                    &mut found,
+                    &mut deselected,
+                    &toolbar_button_rects,
+                );
+                page_geometry = (page_origin, page_width / page.width);
+                selected_text = found.map(|selection: Selection| selection.text);
+                if selected_text.is_some() {
+                    toolbar_active = true;
+                }
+
+                if toolbar_active {
+                    let mut next_toolbar_button_rects = Vec::new();
+                    let scale = page_width / page.width;
+                    let padding_target = egui::pos2(
+                        page_origin.x + (13.0 + 6.0 * 8.0) * scale,
+                        page_origin.y + 25.0 * scale,
+                    );
+                    let origin = padding_target - egui::vec2(2.0, 2.0);
+                    let screen = ui.ctx().content_rect();
+                    let mut toolbar = egui::Ui::new(
+                        ctx.clone(),
+                        egui::Id::unique("reader_selection_toolbar_reselection_test"),
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_max(origin, screen.max))
+                            .layer_id(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::unique("reader_selection_toolbar_reselection_test"),
+                            )),
+                    );
+                    for (index, rect) in toolbar_button_rects.iter().copied().enumerate() {
+                        toolbar.interact(
+                            rect,
+                            egui::Id::unique((
+                                "reader_selection_toolbar_reselection_guard_test",
+                                index,
+                            )),
+                            egui::Sense::click_and_drag(),
+                        );
+                    }
+                    let response = egui::Frame::popup(toolbar.style()).show(&mut toolbar, |ui| {
+                        let button = ui.button("复制");
+                        copy_button_rect = Some(button.rect);
+                        copy_clicked = button.clicked();
+                        next_toolbar_button_rects.push(button.rect);
+                    });
+                    toolbar_frame_rect = Some(response.response.rect);
+                    toolbar_button_rects = next_toolbar_button_rects;
+                } else {
+                    toolbar_button_rects.clear();
+                    copy_button_rect = None;
+                    toolbar_frame_rect = None;
+                }
+                if copy_clicked {
+                    select = None;
+                    toolbar_active = false;
+                    toolbar_button_rects.clear();
+                    toolbar_frame_rect = None;
+                }
+            });
+            output.textures_delta.clear();
+            (
+                selected_text,
+                page_geometry,
+                copy_clicked,
+                copy_button_rect,
+                toolbar_frame_rect,
+            )
+        };
+
+        let (_, (page_origin, scale), _, _, _) = run_frame(Vec::new());
+        let point = |index: usize| {
+            egui::pos2(
+                page_origin.x + (13.0 + index as f32 * 8.0) * scale,
+                page_origin.y + 25.0 * scale,
+            )
+        };
+        let press = |start: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+
+        let first_start = point(1);
+        let first_end = point(5);
+        run_frame(press(first_start));
+        run_frame(vec![egui::Event::PointerMoved(first_end)]);
+        let (first_text, _, _, copy_button_rect, toolbar_frame_rect) =
+            run_frame(vec![egui::Event::PointerButton {
+                pos: first_end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        let second_start = point(6);
+        let second_end = point(2);
+        assert!(
+            toolbar_frame_rect
+                .expect("toolbar should be rendered")
+                .contains(second_start),
+            "second selection should begin in the toolbar's frame padding"
+        );
+        assert!(
+            !copy_button_rect
+                .expect("toolbar should expose the copy button")
+                .contains(second_start),
+            "frame padding must not count as a toolbar button"
+        );
+        run_frame(press(second_start));
+        run_frame(vec![egui::Event::PointerMoved(second_end)]);
+        let (second_text, _, _, copy_button_rect, _) =
+            run_frame(vec![egui::Event::PointerButton {
+                pos: second_end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+
+        let copy_button = copy_button_rect
+            .expect("toolbar should be rendered after the next selection")
+            .center();
+        run_frame(press(copy_button));
+        let (_, _, clicked, _, _) = run_frame(vec![egui::Event::PointerButton {
+            pos: copy_button,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(clicked, "toolbar button should still receive its click");
+
+        let third_start = point(1);
+        let third_end = point(3);
+        run_frame(press(third_start));
+        run_frame(vec![egui::Event::PointerMoved(third_end)]);
+        let (third_text, _, _, _, _) = run_frame(vec![egui::Event::PointerButton {
+            pos: third_end,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert_eq!(first_text.as_deref(), Some("bcdef"));
+        assert_eq!(second_text.as_deref(), Some("cdefg"));
+        assert_eq!(third_text.as_deref(), Some("bcd"));
     }
 
     #[test]

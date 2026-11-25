@@ -128,12 +128,8 @@ impl SepiolaApp {
     /// 浮动工具条：贴在选区的上方或下方，位置不受鼠标影响，不会因悬停而跳动。
     pub fn selection_toolbar(&mut self, ui: &egui::Ui) {
         let ctx = ui.ctx();
-        let Some((text, id, rect, highlight)) = self
-            .library
-            .reader
-            .selection
-            .as_ref()
-            .map(|selection| {
+        let Some((text, id, rect, highlight)) =
+            self.library.reader.selection.as_ref().map(|selection| {
                 (
                     selection.text.clone(),
                     selection.id,
@@ -142,13 +138,13 @@ impl SepiolaApp {
                 )
             })
         else {
-            self.library.reader.toolbar_rect = None;
+            self.library.reader.toolbar_button_rects.clear();
             return;
         };
         // 选区滚出可视区域后不再显示工具条。
         let screen = ctx.content_rect();
         if !screen.expand(24.0).intersects(rect) {
-            self.library.reader.toolbar_rect = None;
+            self.library.reader.toolbar_button_rects.clear();
             return;
         }
         // 用上一帧实测尺寸估算位置，第一次出现时用默认值。
@@ -171,48 +167,57 @@ impl SepiolaApp {
         let mut action: Option<Action> = None;
         let mut toolbar = egui::Ui::new(
             ctx.clone(),
-            egui::Id::new("reader_selection_toolbar"),
+            egui::Id::unique("reader_selection_toolbar"),
             egui::UiBuilder::new()
                 .max_rect(egui::Rect::from_min_max(origin, screen.max))
                 .layer_id(egui::LayerId::new(
                     egui::Order::Foreground,
-                    egui::Id::new("reader_selection_toolbar"),
+                    egui::Id::unique("reader_selection_toolbar"),
                 )),
         );
-        // 工具条自身要挡住它下面的页面/文字：按钮只感知点击，而页面控件感知
-        // 点击+拖拽，egui 会把按在按钮上的拖动同时算给页面，页面选区就被重新
-        // 锚定到按钮下方，表现为点工具条时选区（页面）乱跳。
-        // 在按钮之前铺一层只覆盖工具条矩形的透明拖拽区，作为按下时的拖拽目标；
-        // 按钮在其后创建，点击仍归按钮，工具条外的空白依旧可以穿透去拖选文字。
-        toolbar.interact(
-            egui::Rect::from_min_size(origin, size),
-            egui::Id::new("reader_selection_toolbar_guard"),
-            egui::Sense::click_and_drag(),
-        );
+        // 按钮只感知点击，而页面控件感知点击+拖拽，egui 会把按在按钮上的
+        // 拖动同时算给页面；只给上一帧的按钮铺拖拽保护区，周围空白仍可选字。
+        for (index, rect) in self
+            .library
+            .reader
+            .toolbar_button_rects
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            toolbar.interact(
+                rect,
+                egui::Id::unique(("reader_selection_toolbar_guard", index)),
+                egui::Sense::click_and_drag(),
+            );
+        }
+        let mut toolbar_button_rects = Vec::new();
         let response = egui::Frame::popup(toolbar.style()).show(&mut toolbar, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("复制").clicked() {
+                let response = ui.button("复制");
+                toolbar_button_rects.push(response.rect);
+                if response.clicked() {
                     action = Some(Action::Copy);
                 }
-                if ui
+                let response = ui
                     .add_enabled(configured, egui::Button::new("翻译"))
-                    .on_disabled_hover_text("在 config.toml 配置 [reader.ai] 后可用")
-                    .clicked()
-                {
+                    .on_disabled_hover_text("在 config.toml 配置 [reader.ai] 后可用");
+                toolbar_button_rects.push(response.rect);
+                if response.clicked() {
                     action = Some(Action::Translate);
                 }
-                if ui
+                let response = ui
                     .add_enabled(configured, egui::Button::new("AI 解释"))
-                    .on_disabled_hover_text("在 config.toml 配置 [reader.ai] 后可用")
-                    .clicked()
-                {
+                    .on_disabled_hover_text("在 config.toml 配置 [reader.ai] 后可用");
+                toolbar_button_rects.push(response.rect);
+                if response.clicked() {
                     action = Some(Action::Explain);
                 }
-                if ui
+                let response = ui
                     .add_enabled(configured, egui::Button::new("添加卡片"))
-                    .on_disabled_hover_text("在 config.toml 配置 [reader.ai] 后可用")
-                    .clicked()
-                {
+                    .on_disabled_hover_text("在 config.toml 配置 [reader.ai] 后可用");
+                toolbar_button_rects.push(response.rect);
+                if response.clicked() {
                     action = Some(Action::Card);
                 }
                 // 高亮：只在正文选区上可用（弹窗里的文字没有章节位置）。
@@ -221,37 +226,39 @@ impl SepiolaApp {
                         let swatch = egui::Button::new("")
                             .fill(egui::Color32::from_rgb(color[0], color[1], color[2]))
                             .min_size(egui::vec2(14.0, 14.0));
-                        if ui.add(swatch).on_hover_text(name).clicked() {
+                        let response = ui.add(swatch).on_hover_text(name);
+                        toolbar_button_rects.push(response.rect);
+                        if response.clicked() {
                             action = Some(Action::Highlight(color));
                         }
                     }
-                    if ui
-                        .button("取消高亮")
-                        .on_hover_text("移除选中文字上的高亮")
-                        .clicked()
-                    {
+                    let response = ui.button("取消高亮").on_hover_text("移除选中文字上的高亮");
+                    toolbar_button_rects.push(response.rect);
+                    if response.clicked() {
                         action = Some(Action::Unhighlight);
                     }
                 }
-                if ui.button("分享").clicked() {
+                let response = ui.button("分享");
+                toolbar_button_rects.push(response.rect);
+                if response.clicked() {
                     action = Some(Action::Share);
                 }
-                if ui
+                let response = ui
                     .add_enabled(dictionary, egui::Button::new("词典"))
-                    .on_disabled_hover_text(
-                        "在 config.toml 配置 [reader.dictionary] url 后可用",
-                    )
-                    .clicked()
-                {
+                    .on_disabled_hover_text("在 config.toml 配置 [reader.dictionary] url 后可用");
+                toolbar_button_rects.push(response.rect);
+                if response.clicked() {
                     action = Some(Action::Dictionary);
                 }
                 ui.separator();
-                if ui.button("关闭").clicked() {
+                let response = ui.button("关闭");
+                toolbar_button_rects.push(response.rect);
+                if response.clicked() {
                     action = Some(Action::Close);
                 }
             });
         });
-        self.library.reader.toolbar_rect = Some(response.response.rect);
+        self.library.reader.toolbar_button_rects = toolbar_button_rects;
         // 鼠标悬停时不再更新尺寸，避免尺寸变化反过来影响位置判断。
         if !response.response.hovered() {
             self.library.reader.toolbar_size = Some(response.response.rect.size());
@@ -314,7 +321,7 @@ impl SepiolaApp {
             .lock()
             .clear_selection();
         self.library.reader.selection = None;
-        self.library.reader.toolbar_rect = None;
+        self.library.reader.toolbar_button_rects.clear();
         // 位图页面上的自定义文字选区也要一起清掉。
         self.library.reader.pdf_select = None;
     }
@@ -575,5 +582,52 @@ mod tests {
                 "工具条应保持在屏幕内：{rect:?}"
             );
         }
+    }
+
+    #[test]
+    fn toolbar_hit_box_only_covers_its_contents() {
+        let ctx = egui::Context::default();
+        let origin = egui::pos2(100.0, 100.0);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let mut frame_rect = None;
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(screen);
+        let mut output = ctx.run_ui(input, |_ui| {
+            let mut toolbar = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::unique("reader_selection_toolbar_test"),
+                egui::UiBuilder::new()
+                    .max_rect(egui::Rect::from_min_max(origin, screen.max))
+                    .layer_id(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::unique("reader_selection_toolbar_test"),
+                    )),
+            );
+            let response = egui::Frame::popup(toolbar.style()).show(&mut toolbar, |ui| {
+                ui.horizontal(|ui| {
+                    for label in [
+                        "复制",
+                        "翻译",
+                        "AI 解释",
+                        "添加卡片",
+                        "分享",
+                        "词典",
+                        "关闭",
+                    ] {
+                        let _ = ui.button(label);
+                    }
+                });
+            });
+            frame_rect = Some(response.response.rect);
+        });
+        output.textures_delta.clear();
+
+        let frame_rect = frame_rect.expect("toolbar should be rendered");
+        assert!(frame_rect.left() >= origin.x);
+        assert!(frame_rect.top() >= origin.y);
+        assert!(
+            frame_rect.width() < 500.0 && frame_rect.height() < 100.0,
+            "toolbar frame should only cover its contents: {frame_rect:?}"
+        );
     }
 }
