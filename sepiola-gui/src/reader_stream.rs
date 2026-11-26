@@ -1440,6 +1440,32 @@ impl SepiolaApp {
         // 只取当前渲染窗口内各章的缓存分析结果，避免把整本书的彩标都传进来。
         let show_annotations = self.library.reader.show_annotations;
 
+        // PageDown/PageUp/Space 按视口高度整屏翻页。正文 `TextEdit` 聚焦时同样生效，
+        // 但搜索框、AI 对话等真实输入框聚焦时不拦截，避免影响打字。
+        let focused = ui.ctx().memory(|m| m.focused());
+        if focused.is_none() || focused == self.library.reader.body_focus {
+            let page_step = viewport_height;
+            let delta = ui.input(|input| {
+                if input.key_pressed(egui::Key::PageDown) {
+                    Some(page_step)
+                } else if input.key_pressed(egui::Key::PageUp) {
+                    Some(-page_step)
+                } else if input.key_pressed(egui::Key::Space) {
+                    Some(page_step)
+                } else {
+                    None
+                }
+            });
+            if let Some(delta) = delta {
+                let base = self
+                    .library
+                    .reader
+                    .pending_offset
+                    .unwrap_or(self.library.reader.stream_offset);
+                self.library.reader.pending_offset = Some(base + delta);
+            }
+        }
+
         let mut offset_override = self.library.reader.pending_offset.take();
         let offset_before = offset_override.unwrap_or(self.library.reader.stream_offset);
         // 首帧还没实测正文换行宽度，预排版高度会失准，先允许渲染、下一帧再回补。
@@ -1682,6 +1708,12 @@ impl SepiolaApp {
                         &mut self.library.reader.image_textures,
                     )
                 };
+                // 记录聚焦的正文段，供翻页快捷键判断是否应放行 Space。
+                for segment in &render.segments {
+                    if segment.output.response.has_focus() {
+                        self.library.reader.body_focus = Some(segment.id);
+                    }
+                }
                 // 恢复阅读位置：把锚点那一行滚到视口顶部（只做一次）。
                 if self.library.reader.restore_anchor.is_some()
                     && index == self.library.reader.position_chapter
@@ -2992,6 +3024,101 @@ mod tests {
         assert!(
             (y1 - y2).abs() <= 1.0,
             "两幅行内图的续排应在同一行：{y1} vs {y2}"
+        );
+    }
+
+    #[test]
+    fn page_keys_scroll_by_one_viewport() {
+        let ctx = egui::Context::default();
+        let mut app = SepiolaApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        app.library.root.clear();
+        app.library.reader = crate::reader::ReaderState::default();
+        let document = Arc::new(BookDocument {
+            chapters: vec![Chapter {
+                title: "长章节".to_owned(),
+                text: "alpha beta gamma delta epsilon zeta eta theta ".repeat(1500),
+                ..Chapter::default()
+            }],
+            ..BookDocument::default()
+        });
+        app.library.reader.document = Some(document.clone());
+        let mut time = 0.0;
+        let mut frame = |app: &mut SepiolaApp, events: Vec<egui::Event>| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            ));
+            input.time = Some(time);
+            input.events = events;
+            time += 0.1;
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.reader_stream(ui, &document);
+                });
+            });
+            output.textures_delta.clear();
+        };
+        let key = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for _ in 0..5 {
+            frame(&mut app, Vec::new());
+        }
+        assert!(
+            app.library.reader.stream_offset.abs() < 1.0,
+            "初始应停在顶部"
+        );
+        // PageDown 向下翻一屏（≈视口高度 584，容差覆盖边距与滚动条）。
+        frame(&mut app, vec![key(egui::Key::PageDown)]);
+        let after_down = app.library.reader.stream_offset;
+        assert!(
+            (450.0..650.0).contains(&after_down),
+            "PageDown 应滚动约一屏，实际 {after_down}"
+        );
+        // PageUp 翻回顶部。
+        frame(&mut app, vec![key(egui::Key::PageUp)]);
+        assert!(
+            app.library.reader.stream_offset.abs() < 1.0,
+            "PageUp 应回到顶部，实际 {}",
+            app.library.reader.stream_offset
+        );
+        // Space 向下翻一屏。
+        frame(&mut app, vec![key(egui::Key::Space)]);
+        let after_space = app.library.reader.stream_offset;
+        assert!(
+            (450.0..650.0).contains(&after_space),
+            "Space 应滚动约一屏，实际 {after_space}"
+        );
+        // 点击正文后 Space 仍要翻页：正文 TextEdit 拿到焦点不算打字输入。
+        let click = egui::Event::PointerButton {
+            pos: egui::pos2(400.0, 300.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![click]);
+        assert!(
+            app.library.reader.body_focus.is_some(),
+            "点击正文后应记录正文段焦点"
+        );
+        frame(&mut app, vec![key(egui::Key::Space)]);
+        assert!(
+            app.library.reader.stream_offset > after_space + 450.0,
+            "正文聚焦时 Space 仍应向下翻页，实际 {}",
+            app.library.reader.stream_offset
+        );
+        // 真实输入框（如搜索框）聚焦时 Space 不拦截，交给打字。
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique("fake_search_input")));
+        let before = app.library.reader.stream_offset;
+        frame(&mut app, vec![key(egui::Key::Space)]);
+        assert!(
+            (app.library.reader.stream_offset - before).abs() < 1.0,
+            "输入框聚焦时 Space 不应翻页"
         );
     }
 }

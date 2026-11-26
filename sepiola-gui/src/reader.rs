@@ -168,6 +168,9 @@ pub struct ReaderState {
     pub stream_offset: f32,
     /// 下一帧需要强制设置到 `ScrollArea` 的偏移（用于回补后的位置校正）。
     pub pending_offset: Option<f32>,
+    /// 上一帧聚焦的正文段 `TextEdit` 的 Id；用于区分正文与真实输入框，
+    /// 保证 PageUp/PageDown/Space 在点选正文后仍能翻页。
+    pub body_focus: Option<egui::Id>,
     pub selection: Option<Selection>,
     /// 上一帧工具条按钮矩形；按钮接收点击，周围空白允许正文继续选字。
     pub toolbar_button_rects: Vec<egui::Rect>,
@@ -318,6 +321,7 @@ impl Default for ReaderState {
             separator_height: 22.0,
             stream_offset: 0.0,
             pending_offset: None,
+            body_focus: None,
             selection: None,
             toolbar_button_rects: Vec::new(),
             toolbar_size: None,
