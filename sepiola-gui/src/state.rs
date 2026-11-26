@@ -213,7 +213,7 @@ impl SepiolaApp {
         cc.egui_ctx.options_mut(|options| {
             options.input_options.zoom_modifier = egui::Modifiers::NONE;
         });
-        Self {
+        let mut app = Self {
             label_selection,
             tab,
             library,
@@ -276,7 +276,12 @@ impl SepiolaApp {
             person_edit_text: String::new(),
             merge_target: String::new(),
             remove_delete_dir: true,
+        };
+        // TEMP(live-test): 启动时自动打开指定书籍，便于缩放居中验证。
+        if let Ok(rel) = std::env::var("SEPIOLA_DEBUG_OPEN_PDF") {
+            app.open_book(PathBuf::from(rel));
         }
+        app
     }
 
     pub fn persist_user_settings_if_changed(&mut self) {

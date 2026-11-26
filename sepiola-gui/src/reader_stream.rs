@@ -621,7 +621,7 @@ const PDF_TEXTURE_MAX_WIDTH: u32 = 4096;
 fn adaptive_pdf_dpi(width: f32, pixels_per_point: f32, page_pt_width: f32) -> u32 {
     let needed = width * pixels_per_point / (page_pt_width / 72.0);
     let texture_cap = PDF_TEXTURE_MAX_WIDTH as f32 * 72.0 / page_pt_width;
-    needed.min(texture_cap).clamp(96.0, 480.0).ceil() as u32
+    needed.min(texture_cap).clamp(96.0, 480.0).round() as u32
 }
 
 fn pdf_dpi_viewport_changed(
@@ -711,7 +711,10 @@ fn pdf_page_block(
     deselected: &mut bool,
     toolbar_buttons: &[egui::Rect],
 ) -> ChapterRender {
-    let width = ui.available_width() * zoom;
+    let available = ui.available_width();
+    let width = available * zoom;
+    // 缩小后页面比视口窄时左右留白，保持水平居中。
+    let pad = ((available - width) * 0.5).max(0.0);
     let PdfPageView {
         data,
         dims,
@@ -723,11 +726,34 @@ fn pdf_page_block(
     let has_data = data.is_some();
     if let Some(data) = data {
         if let Some(texture) = pdf_page_texture(textures, ui.ctx(), index, &data) {
-            let size = egui::Vec2::new(width, width / aspect);
-            let (allocated, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+            // 按纹理实际像素尺寸反算逻辑大小，保证 Nearest 贴图 1:1；
+            // 若用 available*zoom 的浮点尺寸，ceil 后多出的几像素会被不均匀
+            // 丢弃，文字边缘出现"上虚下实"的条纹。
+            // 纹理与目标宽度差 >5% 时（过渡帧旧分辨率、占位）退回计算尺寸。
+            let ppp = ui.ctx().pixels_per_point();
+            let tex = texture.size();
+            let target_px = width * ppp;
+            let size = if target_px > 0.0
+                && (tex[0] as f32 - target_px).abs() / target_px < 0.05
+            {
+                egui::Vec2::new(tex[0] as f32 / ppp, tex[1] as f32 / ppp)
+            } else {
+                egui::Vec2::new(width, width / aspect)
+            };
+            // 缩小后页面比视口窄时左右留白，保持水平居中。
+            let pad = ((available - size.x) * 0.5).max(0.0);
+            let allocated = if pad > 0.0 {
+                ui.horizontal(|ui| {
+                    ui.add_space(pad);
+                    ui.allocate_exact_size(size, egui::Sense::hover()).0
+                })
+                .inner
+            } else {
+                ui.allocate_exact_size(size, egui::Sense::hover()).0
+            };
             // 位图对齐到物理像素网格：滚动偏移通常是小数，贴在非整数像素上时
             // 整页会被线性过滤重采样，文字看起来发虚。
-            let rect = allocated.round_to_pixels(ui.ctx().pixels_per_point());
+            let rect = allocated.round_to_pixels(ppp);
             ui.painter().image(
                 texture.id(),
                 rect,
@@ -740,8 +766,15 @@ fn pdf_page_block(
     let Some(rect) = page_rect else {
         // 占位：按已知或估算的宽高比留白，渲染完成后布局自动更新。
         let height = width / aspect;
-        let (rect, _) =
-            ui.allocate_exact_size(egui::Vec2::new(width, height), egui::Sense::hover());
+        let rect = if pad > 0.0 {
+            ui.horizontal(|ui| {
+                ui.add_space(pad);
+                ui.allocate_exact_size(egui::Vec2::new(width, height), egui::Sense::hover()).0
+            })
+            .inner
+        } else {
+            ui.allocate_exact_size(egui::Vec2::new(width, height), egui::Sense::hover()).0
+        };
         ui.painter()
             .rect_filled(rect, 4.0, ui.visuals().faint_bg_color);
         let label = if has_data {
@@ -1414,6 +1447,7 @@ impl SepiolaApp {
         // PDF 页面模式：Ctrl+滚轮按比例缩放页面（向上放大、向下缩小），
         // 不带 Ctrl 的滚轮照常上下滚动页面。
         let mut zoom = self.library.reader.pdf_zoom;
+        let zoom_initial = zoom;
         if page_mode {
             let ctrl_held = ui.input(|input| input.modifiers.command);
             let over_content = ui
@@ -1459,8 +1493,14 @@ impl SepiolaApp {
             if let Some((page_pt_width, _)) =
                 self.library.reader.pdf_page_pt.filter(|(pt, _)| *pt > 1.0)
             {
-                // 按页在屏幕上实际占用的物理像素反推渲染分辨率，1:1 贴图；缩放后按放大宽度渲染。
-                let target = adaptive_pdf_dpi(width * zoom, pixels_per_point, page_pt_width);
+                // 用滚动区内的实际可用宽度（不含滚动条）算 dpi，避免纹理比显示区宽
+                // 几个像素导致 Nearest 重采样发虚；首帧尚无内宽时退回到外层宽度。
+                let inner_w = if self.library.reader.stream_inner_width > 1.0 {
+                    self.library.reader.stream_inner_width
+                } else {
+                    width
+                };
+                let target = adaptive_pdf_dpi(inner_w * zoom, pixels_per_point, page_pt_width);
                 let current = self.library.reader.pdf_dpi;
                 // 2% 余量只过滤滚动条出现等 1~2px 的抖动。
                 let threshold = 0.02;
@@ -1694,6 +1734,11 @@ impl SepiolaApp {
             });
         if let Some(offset) = offset_override {
             scroll = scroll.vertical_scroll_offset(offset);
+        }
+        // 缩放变化后把页面水平居中：放大时左右溢出量相等。
+        if page_mode && (zoom - zoom_initial).abs() > 0.001 && zoom > 1.001 {
+            let inner = self.library.reader.stream_inner_width.max(1.0);
+            scroll = scroll.horizontal_scroll_offset(inner * (zoom - 1.0) * 0.5);
         }
         let output = scroll.show(ui, |ui| {
             for index in start..=end {
@@ -2638,7 +2683,7 @@ mod tests {
 
     #[test]
     fn adaptive_pdf_dpi_tracks_visible_physical_width() {
-        assert_eq!(adaptive_pdf_dpi(800.0, 2.0, 612.0), 189);
+        assert_eq!(adaptive_pdf_dpi(800.0, 2.0, 612.0), 188);
     }
 
     #[test]
@@ -3290,6 +3335,13 @@ mod tests {
             "滚轮应被缩放消费，不应滚动正文，实际偏移 {}",
             app.library.reader.stream_offset
         );
+        // 缩小后页面水平居中：左右留白相等。
+        let left_gap = after_out.left() - fit.left();
+        let right_gap = fit.right() - after_out.right();
+        assert!(
+            (left_gap - right_gap).abs() < 2.0,
+            "缩小后页面应居中：左留白 {left_gap} vs 右留白 {right_gap}"
+        );
         // Ctrl+向上滚一格：回到适配宽度。
         let after_in = frame(&mut app, {
             let mut events = hover.clone();
@@ -3324,6 +3376,33 @@ mod tests {
         assert!(
             (app.library.reader.pdf_zoom - zoom_before_scroll).abs() < 0.001,
             "不带 Ctrl 的滚轮不应改变缩放"
+        );
+        // Ctrl+向上滚两格放大：页面超出视口，且左右溢出对称（重新居中）。
+        let mut big = after_in;
+        for _ in 0..2 {
+            big = frame(&mut app, {
+                let mut events = modifiers(egui::Modifiers::COMMAND);
+                events.extend(hover.clone());
+                events.extend(wheel(30.0, egui::Modifiers::COMMAND));
+                events
+            });
+        }
+        assert!(
+            app.library.reader.pdf_zoom > 1.2,
+            "放大两格后缩放应大于 1.2，实际 {}",
+            app.library.reader.pdf_zoom
+        );
+        assert!(
+            big.width() > fit.width() * 1.2 - 2.0,
+            "放大后页面宽度应随之增大：{} vs {}",
+            big.width(),
+            fit.width()
+        );
+        let left_over = fit.left() - big.left();
+        let right_over = big.right() - fit.right();
+        assert!(
+            left_over > 10.0 && right_over > 10.0 && (left_over - right_over).abs() < 3.0,
+            "放大后页面应居中：左溢出 {left_over} vs 右溢出 {right_over}"
         );
     }
 }
