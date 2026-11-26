@@ -209,6 +209,10 @@ impl SepiolaApp {
         }
         let label_selection = crate::reader_selection::LabelSelectionSink::default();
         cc.egui_ctx.add_plugin(label_selection.clone());
+        // Ctrl+滚轮留给 PDF 页面缩放，关闭 egui 内置的整界面缩放，避免两者冲突。
+        cc.egui_ctx.options_mut(|options| {
+            options.input_options.zoom_modifier = egui::Modifiers::NONE;
+        });
         Self {
             label_selection,
             tab,

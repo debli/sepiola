@@ -256,11 +256,12 @@ fn measure_chapter_height(
     line_spacing: f32,
     paragraph_spacing: f32,
     width: f32,
+    zoom: f32,
     pdf_page: Option<&PdfPageView>,
 ) -> f32 {
     // PDF 页面渲染模式：块高就是整页位图的高度（未渲染时按比例估算）。
     if let Some(pdf) = pdf_page {
-        return width / pdf.aspect.max(0.2) + ui.spacing().item_spacing.y;
+        return width * zoom / pdf.aspect.max(0.2) + ui.spacing().item_spacing.y;
     }
     let text_color = ui.visuals().text_color();
     let spacing = line_spacing.max(0.5);
@@ -624,22 +625,26 @@ fn adaptive_pdf_dpi(width: f32, pixels_per_point: f32, page_pt_width: f32) -> u3
 }
 
 fn pdf_dpi_viewport_changed(
-    previous: Option<(f32, f32)>,
+    previous: Option<(f32, f32, f32)>,
     width: f32,
     pixels_per_point: f32,
+    zoom: f32,
 ) -> bool {
-    previous.is_none_or(|(previous_width, previous_ppp)| {
-        (width - previous_width).abs() > 0.5 || (pixels_per_point - previous_ppp).abs() > 0.01
+    previous.is_none_or(|(previous_width, previous_ppp, previous_zoom)| {
+        (width - previous_width).abs() > 0.5
+            || (pixels_per_point - previous_ppp).abs() > 0.01
+            || (zoom - previous_zoom).abs() > 0.01
     })
 }
 
 fn pdf_dpi_update_needed(
-    previous: Option<(f32, f32)>,
+    previous: Option<(f32, f32, f32)>,
     width: f32,
     pixels_per_point: f32,
+    zoom: f32,
     interaction_active: bool,
 ) -> bool {
-    !interaction_active && pdf_dpi_viewport_changed(previous, width, pixels_per_point)
+    !interaction_active && pdf_dpi_viewport_changed(previous, width, pixels_per_point, zoom)
 }
 
 fn pdf_page_aspect(
@@ -698,6 +703,7 @@ fn pdf_page_block(
     ui: &mut egui::Ui,
     index: usize,
     pdf: PdfPageView,
+    zoom: f32,
     textures: &mut HashMap<(usize, usize), Option<egui::TextureHandle>>,
     text: Option<&PdfTextPage>,
     select: &mut Option<PdfSelect>,
@@ -705,7 +711,7 @@ fn pdf_page_block(
     deselected: &mut bool,
     toolbar_buttons: &[egui::Rect],
 ) -> ChapterRender {
-    let width = ui.available_width();
+    let width = ui.available_width() * zoom;
     let PdfPageView {
         data,
         dims,
@@ -1405,24 +1411,56 @@ impl SepiolaApp {
         let pixels_per_point = ui.ctx().pixels_per_point();
         let interaction_active =
             self.library.reader.selection.is_some() || ui.input(|input| input.pointer.any_down());
+        // PDF 页面模式：Ctrl+滚轮按比例缩放页面（向上放大、向下缩小），
+        // 不带 Ctrl 的滚轮照常上下滚动页面。
+        let mut zoom = self.library.reader.pdf_zoom;
+        if page_mode {
+            let ctrl_held = ui.input(|input| input.modifiers.command);
+            let over_content = ui
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|pos| {
+                    ui.max_rect().contains(pos)
+                        && ui
+                            .ctx()
+                            .layer_id_at(pos)
+                            .is_some_and(|layer| layer.order == egui::Order::Background)
+                });
+            if ctrl_held && over_content {
+                let wheel = ui.input(|input| input.smooth_scroll_delta().y);
+                if wheel.abs() > 0.5 {
+                    // 每格滚轮约 ±10%；自然滚动方向下向上为放大。
+                    let next = (zoom * (wheel * 0.004).exp()).clamp(0.5, 4.0);
+                    if (next - zoom).abs() > 0.001 {
+                        zoom = next;
+                        self.library.reader.pdf_zoom = next;
+                        ui.ctx().request_repaint();
+                    }
+                    // 消费滚轮增量，避免 ScrollArea 同时把页面滚走。
+                    ui.ctx().input_mut(|input| {
+                        input.smooth_scroll_delta = egui::Vec2::ZERO;
+                    });
+                }
+            }
+        }
         let dpi_update_needed = pdf_dpi_update_needed(
             self.library.reader.pdf_dpi_viewport,
             width,
             pixels_per_point,
+            zoom,
             interaction_active,
         );
         // 选区或指针交互期间暂缓换分辨率，避免工具条点击时的瞬时布局变化触发整页重渲染。
         // 交互结束后仍会按实际视口尺寸更新。
         if page_mode && width > 100.0 && dpi_update_needed {
-            self.library.reader.pdf_dpi_viewport = Some((width, pixels_per_point));
+            self.library.reader.pdf_dpi_viewport = Some((width, pixels_per_point, zoom));
             // 页面点尺寸只认实际渲染结果。`mutool info` 的首页 mediabox 可能
             // 属于封面等异常页（和正文尺寸差很多），用它算 dpi 会把正文页
             // 渲染得过小、再被放大显示，字就发虚。
             if let Some((page_pt_width, _)) =
                 self.library.reader.pdf_page_pt.filter(|(pt, _)| *pt > 1.0)
             {
-                // 按页在屏幕上实际占用的物理像素反推渲染分辨率，1:1 贴图。
-                let target = adaptive_pdf_dpi(width, pixels_per_point, page_pt_width);
+                // 按页在屏幕上实际占用的物理像素反推渲染分辨率，1:1 贴图；缩放后按放大宽度渲染。
+                let target = adaptive_pdf_dpi(width * zoom, pixels_per_point, page_pt_width);
                 let current = self.library.reader.pdf_dpi;
                 // 2% 余量只过滤滚动条出现等 1~2px 的抖动。
                 let threshold = 0.02;
@@ -1510,6 +1548,7 @@ impl SepiolaApp {
                 line_spacing,
                 paragraph_spacing,
                 measured_width,
+                zoom,
                 pdf_page.as_ref(),
             );
             self.library
@@ -1636,8 +1675,13 @@ impl SepiolaApp {
         // 点中 AI 彩标时弹出的条目。
         let mut clicked_annotation: Option<Annotation> = None;
 
-        let mut scroll = egui::ScrollArea::vertical()
-            .id_salt(("reader_stream", generation))
+        // 缩放超过适配宽度时页面比视口宽，需要横向滚动。
+        let mut scroll = if page_mode && zoom > 1.001 {
+            egui::ScrollArea::both()
+        } else {
+            egui::ScrollArea::vertical()
+        }
+        .id_salt(("reader_stream", generation))
             .auto_shrink([false, false])
             // PDF 页面按可用宽度缩放；动态显示滚动条会改变内容宽度，
             // 进而让页面在滚动条出现/收起时短暂放大或缩小。
@@ -1687,6 +1731,7 @@ impl SepiolaApp {
                         ui,
                         index,
                         view,
+                        zoom,
                         &mut self.library.reader.image_textures,
                         page_text.as_deref(),
                         &mut self.library.reader.pdf_select,
@@ -2051,20 +2096,22 @@ mod tests {
 
     #[test]
     fn pdf_dpi_viewport_changes_only_for_layout_or_scale_changes() {
-        let previous = Some((600.0, 1.5));
+        let previous = Some((600.0, 1.5, 1.0));
 
-        assert!(!pdf_dpi_viewport_changed(previous, 600.25, 1.505));
-        assert!(pdf_dpi_viewport_changed(previous, 640.0, 1.5));
-        assert!(pdf_dpi_viewport_changed(previous, 600.0, 2.0));
+        assert!(!pdf_dpi_viewport_changed(previous, 600.25, 1.505, 1.0));
+        assert!(pdf_dpi_viewport_changed(previous, 640.0, 1.5, 1.0));
+        assert!(pdf_dpi_viewport_changed(previous, 600.0, 2.0, 1.0));
+        // 缩放变化同样触发重渲染。
+        assert!(pdf_dpi_viewport_changed(previous, 600.0, 1.5, 1.5));
     }
 
     #[test]
     fn pdf_dpi_update_waits_until_selection_interaction_ends() {
-        let previous = Some((600.0, 1.5));
+        let previous = Some((600.0, 1.5, 1.0));
 
-        assert!(!pdf_dpi_update_needed(previous, 640.0, 1.5, true));
-        assert!(!pdf_dpi_update_needed(previous, 600.0, 1.5, false));
-        assert!(pdf_dpi_update_needed(previous, 640.0, 1.5, false));
+        assert!(!pdf_dpi_update_needed(previous, 640.0, 1.5, 1.0, true));
+        assert!(!pdf_dpi_update_needed(previous, 600.0, 1.5, 1.0, false));
+        assert!(pdf_dpi_update_needed(previous, 640.0, 1.5, 1.0, false));
     }
 
     #[test]
@@ -2300,7 +2347,7 @@ mod tests {
             "pending PDF renders must be polled without another user interaction"
         );
         let dpi_before_toolbar = app.library.reader.pdf_dpi;
-        app.library.reader.pdf_dpi_viewport = Some((0.0, 1.0));
+        app.library.reader.pdf_dpi_viewport = Some((0.0, 1.0, 1.0));
         let (pressed, _) = frame(
             &mut app,
             vec![egui::Event::PointerMoved(button), event(true)],
@@ -2434,6 +2481,7 @@ mod tests {
                         page_aspect: None,
                         aspect: 1.0,
                     },
+                    1.0,
                     &mut textures,
                     Some(&page),
                     &mut select,
@@ -2759,6 +2807,7 @@ mod tests {
                 1.0,
                 12.0,
                 width,
+                1.0,
                 None,
             );
             let top = ui.cursor().top();
@@ -2830,6 +2879,7 @@ mod tests {
                 1.0,
                 0.0,
                 width,
+                1.0,
                 None,
             );
             let top = ui.cursor().top();
@@ -2905,6 +2955,7 @@ mod tests {
                 1.0,
                 0.0,
                 width,
+                1.0,
                 None,
             );
             let top = ui.cursor().top();
@@ -2986,6 +3037,7 @@ mod tests {
                 1.0,
                 0.0,
                 width,
+                1.0,
                 None,
             );
             let top = ui.cursor().top();
@@ -3119,6 +3171,159 @@ mod tests {
         assert!(
             (app.library.reader.stream_offset - before).abs() < 1.0,
             "输入框聚焦时 Space 不应翻页"
+        );
+    }
+
+    #[test]
+    fn ctrl_wheel_zooms_and_plain_wheel_scrolls_pdf() {
+        let ctx = egui::Context::default();
+        let mut app = SepiolaApp::new(&eframe::CreationContext::_new_kittest(ctx.clone()));
+        app.library.root.clear();
+        app.library.reader = crate::reader::ReaderState::default();
+        let document = Arc::new(BookDocument {
+            is_pdf: true,
+            chapters: vec![
+                Chapter {
+                    title: "Page 1".into(),
+                    ..Chapter::default()
+                },
+                Chapter {
+                    title: "Page 2".into(),
+                    ..Chapter::default()
+                },
+            ],
+            ..BookDocument::default()
+        });
+        let reader = &mut app.library.reader;
+        reader.rel = Some("test.pdf".into());
+        reader.pdf_path = Some("test.pdf".into());
+        reader.document = Some(document.clone());
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            200,
+            100,
+            image::Rgba([255, 255, 255, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut png),
+            image::ImageOutputFormat::Png,
+        )
+        .expect("encode png");
+        let png = Arc::new(png);
+        reader.pdf_pages.insert(0, Some(png.clone()));
+        reader.pdf_pages.insert(1, Some(png));
+        reader.pdf_page_aspect.insert(0, 2.0);
+        reader.pdf_page_aspect.insert(1, 2.0);
+        reader.pdf_rendered_dpi.insert(0, reader.pdf_dpi);
+        reader.pdf_rendered_dpi.insert(1, reader.pdf_dpi);
+        let mut time = 0.0;
+        let mut frame = |app: &mut SepiolaApp, events: Vec<egui::Event>| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            ));
+            input.time = Some(time);
+            input.events = events;
+            time += 0.1;
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    app.reader_stream(ui, &document);
+                });
+            });
+            let texture = app.library.reader.image_textures[&(0, 0)]
+                .as_ref()
+                .expect("page texture")
+                .id();
+            let page_rect = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture => {
+                        Some(mesh.calc_bounds())
+                    }
+                    _ => None,
+                })
+                .expect("painted PDF page");
+            output.textures_delta.clear();
+            page_rect
+        };
+        let wheel = |delta_y, modifiers: egui::Modifiers| {
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, delta_y),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+                modifiers,
+            }]
+        };
+        let modifiers = |modifiers: egui::Modifiers| {
+            vec![egui::Event::ModifiersChanged(modifiers)]
+        };
+        // 指针悬停在正文区域内，Ctrl+滚轮才会用于缩放。
+        let hover = vec![egui::Event::PointerMoved(egui::pos2(400.0, 300.0))];
+        for _ in 0..5 {
+            frame(&mut app, hover.clone());
+        }
+        let fit = frame(&mut app, hover.clone());
+        assert_eq!(app.library.reader.pdf_zoom, 1.0);
+        // 按住 Ctrl 向下滚：缩小页面，但不滚动正文。
+        let after_out = frame(&mut app, {
+            let mut events = modifiers(egui::Modifiers::COMMAND);
+            events.extend(hover.clone());
+            events.extend(wheel(-30.0, egui::Modifiers::COMMAND));
+            events
+        });
+        let zoom_out = app.library.reader.pdf_zoom;
+        assert!(
+            (0.85..0.95).contains(&zoom_out),
+            "向下滚一格应缩小约 11%，实际 {zoom_out}"
+        );
+        assert!(
+            (after_out.width() / fit.width() - zoom_out).abs() < 0.02,
+            "页面宽度应按比例缩小：{} vs {} (zoom {zoom_out})",
+            after_out.width(),
+            fit.width()
+        );
+        assert!(
+            app.library.reader.stream_offset.abs() < 1.0,
+            "滚轮应被缩放消费，不应滚动正文，实际偏移 {}",
+            app.library.reader.stream_offset
+        );
+        // Ctrl+向上滚一格：回到适配宽度。
+        let after_in = frame(&mut app, {
+            let mut events = hover.clone();
+            events.extend(wheel(30.0, egui::Modifiers::COMMAND));
+            events
+        });
+        assert!(
+            (app.library.reader.pdf_zoom - 1.0).abs() < 0.02,
+            "向上滚一格应恢复缩放，实际 {}",
+            app.library.reader.pdf_zoom
+        );
+        assert!(
+            (after_in.width() - fit.width() * app.library.reader.pdf_zoom).abs() < 2.0,
+            "缩放回接近 100% 后页面宽度应与缩放倍数成比例：{} vs {} (zoom {})",
+            after_in.width(),
+            fit.width(),
+            app.library.reader.pdf_zoom
+        );
+        // 松开 Ctrl 后滚轮照常滚动页面，缩放保持不变。
+        let zoom_before_scroll = app.library.reader.pdf_zoom;
+        frame(&mut app, {
+            let mut events = modifiers(egui::Modifiers::NONE);
+            events.extend(hover.clone());
+            events.extend(wheel(-30.0, egui::Modifiers::NONE));
+            events
+        });
+        assert!(
+            app.library.reader.stream_offset > 10.0,
+            "不带 Ctrl 的滚轮应滚动页面，实际偏移 {}",
+            app.library.reader.stream_offset
+        );
+        assert!(
+            (app.library.reader.pdf_zoom - zoom_before_scroll).abs() < 0.001,
+            "不带 Ctrl 的滚轮不应改变缩放"
         );
     }
 }

@@ -235,8 +235,10 @@ pub struct ReaderState {
     pub pdf_path: Option<PathBuf>,
     /// PDF 渲染分辨率（按屏幕像素自适应）。
     pub pdf_dpi: u32,
-    /// 已处理的自适应 PDF DPI 视口（正文宽度与每点像素比）。
-    pub pdf_dpi_viewport: Option<(f32, f32)>,
+    /// 已处理的自适应 PDF DPI 视口（正文宽度、每点像素比、页面缩放倍数）。
+    pub pdf_dpi_viewport: Option<(f32, f32, f32)>,
+    /// PDF 页面缩放倍数（1.0 为按正文宽度适配），滚轮缩放时更新。
+    pub pdf_zoom: f32,
     /// 已渲染页的 PNG 数据（`None` 表示该页渲染失败，不再重试）。
     pub pdf_pages: HashMap<usize, Option<Arc<Vec<u8>>>>,
     /// 各页像素尺寸（渲染成功后填充），用于计算显示尺寸。
@@ -359,6 +361,7 @@ impl Default for ReaderState {
             pdf_path: None,
             pdf_dpi: sepiola::reader::pdf::DEFAULT_DPI,
             pdf_dpi_viewport: None,
+            pdf_zoom: 1.0,
             pdf_pages: HashMap::new(),
             pdf_sizes: HashMap::new(),
             pdf_page_aspect: HashMap::new(),
