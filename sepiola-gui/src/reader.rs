@@ -1981,51 +1981,101 @@ impl SepiolaApp {
         egui::Frame::NONE
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
+                // 通知/作者文字此前直接参与行最小宽度，出现瞬间把顶栏行撑宽
+                // 105px，正文区随之变宽（页面放大），通知超时消失后又缩回。
+                // 这里把左侧文字块用 allocate_ui 钳制在“总宽 − 按钮组实测宽”内，
+                // 右侧按钮组按实际标签测量宽度，两侧互不重叠。
+                let analyzing = self.library.reader.analysis_loading.is_some();
+                let analysis_label = if analyzing { "分析中…" } else { "分析本章" };
+                let toc_label = if self.library.reader.toc_open {
+                    "收起目录"
+                } else {
+                    "目录"
+                };
                 ui.horizontal(|ui| {
                     back = pointing_hand(ui.button("← 关闭阅读")).clicked();
-                    let title = self.library.reader.title.clone();
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(title).size(17.0).strong()).truncate(),
-                    );
-                    let author = self.library.reader.author.clone();
-                    if !author.is_empty() {
-                        ui.weak(author);
-                    }
-                    if self
-                        .library
-                        .reader
-                        .notice_until
-                        .is_some_and(|until| Instant::now() < until)
-                    {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(90, 150, 100),
-                            &self.library.reader.notice,
-                        );
-                    }
+                    // 实测右侧按钮组宽度：文字 galley 宽 + 按钮内边距 + 边框 + 间距。
+                    let actions_w = {
+                        let font_id =
+                            ui.style().text_styles[&egui::TextStyle::Button].clone();
+                        let stroke = ui.visuals().widgets.inactive.fg_stroke.width;
+                        let pad = ui.spacing().button_padding.x;
+                        let text_w = |t: &str| {
+                            ui.fonts_mut(|f| {
+                                f.layout_no_wrap(
+                                    t.to_owned(),
+                                    font_id.clone(),
+                                    egui::Color32::PLACEHOLDER,
+                                )
+                            })
+                            .size()
+                            .x
+                                + pad * 2.0
+                                + stroke * 2.0
+                        };
+                        let spacing = ui.spacing().item_spacing.x;
+                        [analysis_label, "分析结果", toc_label, "阅读设置"]
+                            .iter()
+                            .map(|t| text_w(t))
+                            .sum::<f32>()
+                            + spacing * 3.0
+                    };
+                    let left_w = (ui.available_width() - actions_w).max(0.0);
+                    ui.allocate_ui(egui::vec2(left_w, ui.spacing().interact_size.y), |ui| {
+                        let mut job = egui::text::LayoutJob::default();
+                        egui::RichText::new(self.library.reader.title.clone())
+                            .size(17.0)
+                            .strong()
+                            .append_to(
+                                &mut job,
+                                ui.style(),
+                                egui::FontSelection::Default,
+                                egui::Align::Center,
+                            );
+                        let author = self.library.reader.author.clone();
+                        if !author.is_empty() {
+                            egui::RichText::new(format!(" {author}"))
+                                .weak()
+                                .append_to(
+                                    &mut job,
+                                    ui.style(),
+                                    egui::FontSelection::Default,
+                                    egui::Align::Center,
+                                );
+                        }
+                        if self
+                            .library
+                            .reader
+                            .notice_until
+                            .is_some_and(|until| Instant::now() < until)
+                        {
+                            egui::RichText::new(format!(
+                                "  {}",
+                                self.library.reader.notice.clone()
+                            ))
+                            .color(egui::Color32::from_rgb(90, 150, 100))
+                            .append_to(
+                                &mut job,
+                                ui.style(),
+                                egui::FontSelection::Default,
+                                egui::Align::Center,
+                            );
+                        }
+                        ui.add(egui::Label::new(job).truncate());
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if pointing_hand(ui.button("阅读设置")).clicked() {
                             self.library.reader.settings_open = !self.library.reader.settings_open;
                         }
-                        let toc_label = if self.library.reader.toc_open {
-                            "收起目录"
-                        } else {
-                            "目录"
-                        };
                         if pointing_hand(ui.button(toc_label)).clicked() {
                             self.library.reader.toc_open = !self.library.reader.toc_open;
                         }
                         if pointing_hand(ui.button("分析结果")).clicked() {
                             self.library.reader.analysis_open = true;
                         }
-                        let analyzing = self.library.reader.analysis_loading.is_some();
-                        let label = if analyzing {
-                            "分析中…"
-                        } else {
-                            "分析本章"
-                        };
                         let enabled = !analyzing && self.library.reader.ai.enabled();
                         let response = ui
-                            .add_enabled(enabled, egui::Button::new(label))
+                            .add_enabled(enabled, egui::Button::new(analysis_label))
                             .on_disabled_hover_text(sepiola::ai::MISSING_HINT);
                         if pointing_hand(response).clicked() {
                             self.start_analysis();

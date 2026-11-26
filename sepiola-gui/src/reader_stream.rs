@@ -100,7 +100,6 @@ fn styled_job(
         {
             SERIF_BOLD_FAMILY
         }
-        let _ = viewport_changed;
         _ => BOLD_FAMILY,
     };
     let bold_family = egui::FontFamily::Name(bold_name.into());
@@ -1404,11 +1403,6 @@ impl SepiolaApp {
         }
         let page_mode = self.library.reader.pdf_page_mode();
         let pixels_per_point = ui.ctx().pixels_per_point();
-        let viewport_changed = pdf_dpi_viewport_changed(
-            self.library.reader.pdf_dpi_viewport,
-            width,
-            pixels_per_point,
-        );
         let interaction_active =
             self.library.reader.selection.is_some() || ui.input(|input| input.pointer.any_down());
         let dpi_update_needed = pdf_dpi_update_needed(
@@ -2131,6 +2125,11 @@ mod tests {
         let reader = &mut app.library.reader;
         reader.rel = Some("test.pdf".into());
         reader.title = "Database Architecture".into();
+        // 真实触发条件：标题+作者+通知文字合起来超过顶栏行宽，
+        // 旧代码里通知出现瞬间会把正文区 max_rect 撑宽，页面先放大再缩回。
+        reader.author =
+            "(Joseph M. Hellerstein, Michael Stonebraker etc.) (z-library.sk, 1lib.sk, z-lib.sk)"
+                .into();
         reader.pdf_path = Some("test.pdf".into());
         reader.pdf_has_text = true;
         reader.document = Some(document);
