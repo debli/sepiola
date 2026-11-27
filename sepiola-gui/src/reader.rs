@@ -35,6 +35,7 @@ pub(crate) fn selectable_text(
         .frame(egui::Frame::NONE)
         .desired_rows(1)
         .desired_width(width)
+        .margin(egui::Margin::symmetric(0, SELECTION_PAD as i8))
         .show(ui);
     let range = output.cursor_range?;
     if !output.response.has_focus() {
@@ -55,7 +56,10 @@ pub(crate) fn selectable_text(
     Some(Selection {
         text: picked,
         id,
-        rect: head.union(tail).translate(output.galley_pos.to_vec2()),
+        rect: head
+            .union(tail)
+            .translate(output.galley_pos.to_vec2())
+            .expand2(egui::vec2(0.0, SELECTION_PAD)),
         highlight: None,
     })
 }
@@ -84,6 +88,10 @@ fn annotation_back(note: &str, detail: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n\n")
 }
+
+/// 选区上下的留白：同时放大拖选热区（TextEdit 上下 margin）与选区包围盒，
+/// 左右不加，避免侵占相邻文字段的拖选区域。
+pub(crate) const SELECTION_PAD: f32 = 6.0;
 
 /// 当前选中的文字（用于浮动工具条）。
 pub struct Selection {

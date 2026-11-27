@@ -13,7 +13,7 @@ use sepiola::reader::{
     BookDocument, Chapter, ChapterImage, LinkSpan, LinkTarget, ReaderFont, StyleSpan,
 };
 
-use crate::reader::{PdfSelect, Selection};
+use crate::reader::{PdfSelect, Selection, SELECTION_PAD};
 use crate::state::SepiolaApp;
 
 /// 距离底部小于该值时追加下一章。
@@ -797,8 +797,10 @@ fn pdf_page_block(
     if let Some(page) = text {
         if !page.lines.is_empty() && page.width > 0.0 {
             // 把指针位置换算成页面坐标（pt）。
+            let scale = rect.width() / page.width.max(1.0);
+            // 屏幕像素的选区 padding 换算成页面坐标，只加上下、不加左右。
+            let pad_pt = SELECTION_PAD / scale;
             let page_pos = |pos: egui::Pos2| -> (f32, f32) {
-                let scale = rect.width() / page.width.max(1.0);
                 ((pos.x - rect.left()) / scale, (pos.y - rect.top()) / scale)
             };
             // 严格命中：指针必须真的落在某一行文字上（含少量行间/行内容差）。
@@ -812,8 +814,10 @@ fn pdf_page_block(
                 let mut hit: Option<(f32, usize)> = None;
                 for (line_index, line) in page.lines.iter().enumerate() {
                     let height = (line.rect.3 - line.rect.1).max(1.0);
-                    // 只容许上下 35% 行高的偏差；更大的空白一律不命中。
-                    if py < line.rect.1 - height * 0.35 || py > line.rect.3 + height * 0.35 {
+                    // 只容许上下 35% 行高再加选区 padding 的偏差；更大的空白一律不命中。
+                    if py < line.rect.1 - height * 0.35 - pad_pt
+                        || py > line.rect.3 + height * 0.35 + pad_pt
+                    {
                         continue;
                     }
                     let distance = if py < line.rect.1 {
@@ -1018,7 +1022,7 @@ fn pdf_page_block(
                             None => *run,
                         });
                         ui.painter().rect_filled(
-                            run.expand(1.0),
+                            run.expand2(egui::vec2(1.0, SELECTION_PAD)),
                             2.0,
                             ui.visuals().selection.bg_fill.gamma_multiply(0.55),
                         );
@@ -1028,7 +1032,9 @@ fn pdf_page_block(
                         *found = Some(Selection {
                             text: picked,
                             id,
-                            rect: highlight.unwrap_or(rect),
+                            rect: highlight
+                                .unwrap_or(rect)
+                                .expand2(egui::vec2(0.0, SELECTION_PAD)),
                             highlight: None,
                         });
                     }
@@ -1167,7 +1173,7 @@ fn chapter_block(
                     .desired_width(width)
                     // 默认最少 4 行；正文高度由 galley 决定，限定为 1 行。
                     .desired_rows(1)
-                    .margin(egui::Margin::symmetric(0, 0))
+                    .margin(egui::Margin::symmetric(0, SELECTION_PAD as i8))
                     .layouter(&mut layouter)
                     .show(ui);
                 let char_len = chapter.text[start..range.end].chars().count();
@@ -1878,7 +1884,10 @@ impl SepiolaApp {
                                 let selection = Selection {
                                     text: picked,
                                     id: segment.id,
-                                    rect: head.union(tail).translate(offset),
+                                    rect: head
+                                        .union(tail)
+                                        .translate(offset)
+                                        .expand2(egui::vec2(0.0, SELECTION_PAD)),
                                     highlight: Some((
                                         index,
                                         segment.char_base + first,
